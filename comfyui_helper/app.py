@@ -377,6 +377,7 @@ class ComfyHelperApp(App[None]):
             try:
                 value = await self.parse_field_value(field, value_text)
             except Exception as exc:
+                logging.error("parse field %s/%s error: %s", field.node_id, field.name, exc, exc_info=True)
                 self.input_error = str(exc)
                 self.render_all()
                 return False
