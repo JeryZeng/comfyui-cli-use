@@ -1,0 +1,7 @@
+.venv/
+workflows/
+__pycache__/
+*.pyc
+comfy-helper.log
+.agents
+.codex
