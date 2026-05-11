@@ -413,8 +413,8 @@ class ComfyHelperApp(App[None]):
         if len(image_batch) == 0:
             raise ValueError(f"No valid image files found in dir:{value_text}")
         if len(image_batch) == 1:
-            return await self.client.upload_image(image_batch[0])
-        return ImageBatch(images=[await self.client.upload_image(x) for x in image_batch], dir=str(image_path))
+            return await self.client.upload_image(Path(image_batch[0]))
+        return ImageBatch(images=[await self.client.upload_image(Path(x)) for x in image_batch], dir=str(image_path))
 
     async def parse_field_value(self, field: ConfigField, value_text: str) -> Any:
         if field.is_load_image:
