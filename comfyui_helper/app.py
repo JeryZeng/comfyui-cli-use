@@ -3,12 +3,12 @@ from __future__ import annotations
 import asyncio
 import copy
 import glob
+import hashlib
 import json
 import logging
 import os
-import shutil
 import secrets
-import hashlib
+import shutil
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -734,6 +734,13 @@ class ComfyHelperApp(App[None]):
             self.add_message("Workflow data is not available.")
             self.render_all()
             return
+        # save last values
+        workflow_key = self.workflow_history_key(workflow)
+        self.workflow_last_values[workflow_key] = copy.deepcopy(values)
+        serialized_values = self.serialize_history_values(values)
+        self.save_workflow_history(workflow, serialized_values)
+
+        # do submit
         submitted: list[str] = []
         for index in range(count):
             resolved_values_list = self.resolve_submission_values(values)
@@ -746,7 +753,8 @@ class ComfyHelperApp(App[None]):
                     logging.exception("Failed to submit workflow %s", workflow.name)
                     self.add_message(f"Submit failed for {workflow.name}: {short_error(exc)}")
                     if submitted:
-                        self.add_message(f"Submitted {len(submitted)}/{count * len(resolved_values_list)} before failure.")
+                        self.add_message(
+                            f"Submitted {len(submitted)}/{count * len(resolved_values_list)} before failure.")
                     await self.refresh_status()
                     self.render_all()
                     return
@@ -769,11 +777,7 @@ class ComfyHelperApp(App[None]):
         else:
             self.add_message(
                 f"Submitted {workflow.name} {len(submitted)} times, first prompt_id {submitted[0]}, last {submitted[-1]}"
-        )
-        workflow_key = self.workflow_history_key(workflow)
-        self.workflow_last_values[workflow_key] = copy.deepcopy(values)
-        serialized_values = self.serialize_history_values(values)
-        self.save_workflow_history(workflow, serialized_values)
+            )
         self.last_submission = LastSubmission(workflow_name=workflow.name, values=copy.deepcopy(values), count=count)
         await self.refresh_status()
         self.render_all()
@@ -1181,7 +1185,8 @@ class ComfyHelperApp(App[None]):
             if self.config.comfyui_dir is None:
                 lines.append("LoadImage.image accepts a local file or directory. Tab completes paths.")
             else:
-                lines.append("LoadImage.image file or directory will be copied into ComfyUI input. Tab completes paths.")
+                lines.append(
+                    "LoadImage.image file or directory will be copied into ComfyUI input. Tab completes paths.")
         if self.input_error:
             lines.append(f"[red]{escape(self.input_error)}[/]")
         if self.completion_matches:
