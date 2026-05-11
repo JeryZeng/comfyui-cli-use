@@ -3,5 +3,6 @@ workflows/
 __pycache__/
 *.pyc
 comfy-helper.log
+data/
 .agents
 .codex

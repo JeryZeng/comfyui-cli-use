@@ -8,6 +8,7 @@ import logging
 import os
 import shutil
 import secrets
+import hashlib
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -116,6 +117,7 @@ class ComfyHelperApp(App[None]):
         self.active_workflow: WorkflowInfo | None = None
         self.active_field_index = 0
         self.active_values: dict[tuple[str, str], Any] = {}
+        self.active_value_sources: dict[tuple[str, str], str] = {}
         self.batch_after_input = False
         self.batch_workflow: WorkflowInfo | None = None
         self.batch_values: dict[tuple[str, str], Any] = {}
@@ -127,6 +129,9 @@ class ComfyHelperApp(App[None]):
         self.session_cached_nodes: dict[str, set[str]] = {}
         self.session_finished: set[str] = set()
         self.workflow_last_values: dict[str, dict[tuple[str, str], Any]] = {}
+        self.workflow_last_sources: dict[str, dict[tuple[str, str], Any]] = {}
+        self.workflow_history_raw: dict[str, dict[str, Any]] = {}
+        self.workflow_history_dir = Path.cwd() / "data" / "workflow_history"
         self.last_submission: LastSubmission | None = None
         self._tasks: list[asyncio.Task[Any]] = []
         self.spinner_index = 0
@@ -145,6 +150,7 @@ class ComfyHelperApp(App[None]):
         param_input.add_class("hidden")
         param_input.can_focus = False
         self.set_focus(None)
+        self.load_workflow_history()
         for message in self.config.messages:
             self.add_message(message)
         self.reload_workflows()
@@ -319,11 +325,176 @@ class ComfyHelperApp(App[None]):
     def find_workflow_by_name(self, name: str) -> WorkflowInfo | None:
         return next((workflow for workflow in self.workflows if workflow.name == name), None)
 
-    def prefill_values_from_last_workflow(self, workflow: WorkflowInfo) -> dict[tuple[str, str], Any]:
-        values = self.workflow_last_values.get(workflow.name)
-        if values is None:
-            return {}
-        return copy.deepcopy(values)
+    def workflow_history_key(self, workflow: WorkflowInfo) -> str:
+        return str(workflow.path.resolve())
+
+    def load_workflow_history(self) -> None:
+        self.workflow_history_raw = {}
+        if not self.workflow_history_dir.exists():
+            return
+        for path in self.workflow_history_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                logging.exception("Failed to read workflow history %s", path)
+                self.add_message(f"Failed to read workflow history: {short_error(exc)}")
+                continue
+            if not isinstance(data, dict):
+                continue
+            workflow_path = data.get("workflow_path")
+            values = data.get("values")
+            if not isinstance(workflow_path, str) or not isinstance(values, dict):
+                continue
+            self.workflow_history_raw[workflow_path] = data
+
+    async def prefill_values_from_last_workflow(
+            self, workflow: WorkflowInfo
+    ) -> tuple[dict[tuple[str, str], Any], dict[tuple[str, str], str]]:
+        workflow_key = self.workflow_history_key(workflow)
+        values = self.workflow_last_values.get(workflow_key)
+        serialized = self.workflow_last_sources.get(workflow_key)
+        if values is not None and serialized is not None:
+            return copy.deepcopy(values), self.extract_active_value_sources(workflow, serialized)
+
+        raw_history = self.workflow_history_raw.get(workflow_key)
+        if raw_history is None:
+            return {}, {}
+        resolved, resolved_sources = await self.resolve_history_values(workflow, raw_history)
+        self.workflow_last_values[workflow_key] = copy.deepcopy(resolved)
+        self.workflow_last_sources[workflow_key] = copy.deepcopy(resolved_sources)
+        return copy.deepcopy(resolved), copy.deepcopy(resolved_sources)
+
+    async def resolve_history_values(
+            self,
+            workflow: WorkflowInfo,
+            raw_history: dict[str, Any],
+    ) -> tuple[dict[tuple[str, str], Any], dict[tuple[str, str], str]]:
+        values = raw_history.get("values", {})
+        if not isinstance(values, dict):
+            return {}, {}
+
+        field_lookup = {(field.node_id, field.name): field for field in workflow.fields}
+        resolved_values: dict[tuple[str, str], Any] = {}
+        resolved_sources: dict[tuple[str, str], str] = {}
+
+        for key_text, raw_value in values.items():
+            field_key = self.deserialize_field_key(key_text)
+            if field_key is None:
+                continue
+            field = field_lookup.get(field_key)
+            if field is None:
+                continue
+            try:
+                value = await self.deserialize_history_value(field, raw_value)
+            except Exception as exc:
+                logging.exception("Failed to restore workflow history for %s %s", workflow.name, field.display_name)
+                self.add_message(f"History restore skipped: {short_error(exc)}")
+                continue
+            if value is None:
+                continue
+            resolved_values[field_key] = value
+            if field.is_load_image and isinstance(raw_value, dict):
+                source = raw_value.get("path")
+                if isinstance(source, str):
+                    resolved_sources[field_key] = source
+
+        return resolved_values, resolved_sources
+
+    async def deserialize_history_value(self, field: ConfigField, raw_value: Any) -> Any | None:
+        if isinstance(raw_value, dict):
+            value_type = raw_value.get("type")
+            if value_type == "random_seed":
+                return RandomSeedValue()
+            if value_type in {"load_image_file", "load_image_dir"}:
+                source = raw_value.get("path")
+                if not isinstance(source, str) or not source.strip():
+                    return None
+                return await self.prepare_load_image_value(source)
+            return None
+        if field.is_load_image:
+            source = raw_value
+            if not isinstance(source, str) or not source.strip():
+                return None
+            return await self.prepare_load_image_value(source)
+        return raw_value
+
+    def serialize_history_sources(
+            self,
+            workflow: WorkflowInfo,
+            values: dict[tuple[str, str], Any],
+    ) -> dict[str, Any]:
+        serialized: dict[str, Any] = {}
+        field_lookup = {(field.node_id, field.name): field for field in workflow.fields}
+        for field_key, value in values.items():
+            field = field_lookup.get(field_key)
+            if field is None:
+                continue
+            key_text = self.serialize_field_key(field_key)
+            if field.is_load_image:
+                source = self.active_value_sources.get(field_key)
+                if not source:
+                    continue
+                path = Path(source)
+                serialized[key_text] = {
+                    "type": "load_image_dir" if isinstance(value, ImageBatch) or path.is_dir() else "load_image_file",
+                    "path": str(path),
+                }
+                continue
+            if isinstance(value, RandomSeedValue):
+                serialized[key_text] = {"type": "random_seed"}
+            else:
+                serialized[key_text] = copy.deepcopy(value)
+        return serialized
+
+    def extract_active_value_sources(
+            self,
+            workflow: WorkflowInfo,
+            serialized_values: dict[str, Any],
+    ) -> dict[tuple[str, str], str]:
+        field_lookup = {(field.node_id, field.name): field for field in workflow.fields}
+        sources: dict[tuple[str, str], str] = {}
+        for key_text, raw_value in serialized_values.items():
+            field_key = self.deserialize_field_key(key_text)
+            if field_key is None:
+                continue
+            field = field_lookup.get(field_key)
+            if field is None or not field.is_load_image:
+                continue
+            if isinstance(raw_value, dict):
+                source = raw_value.get("path")
+                if isinstance(source, str):
+                    sources[field_key] = source
+        return sources
+
+    def save_workflow_history(self, workflow: WorkflowInfo, serialized_values: dict[str, Any]) -> None:
+        self.workflow_history_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "workflow_path": self.workflow_history_key(workflow),
+            "workflow_name": workflow.name,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "values": serialized_values,
+        }
+        history_path = self.workflow_history_path(workflow)
+        history_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    def workflow_history_path(self, workflow: WorkflowInfo) -> Path:
+        workflow_key = self.workflow_history_key(workflow)
+        digest = hashlib.sha256(workflow_key.encode("utf-8")).hexdigest()[:16]
+        return self.workflow_history_dir / f"{workflow.path.stem}-{digest}.json"
+
+    def serialize_field_key(self, field_key: tuple[str, str]) -> str:
+        return f"{field_key[0]}|{field_key[1]}"
+
+    def deserialize_field_key(self, key_text: str) -> tuple[str, str] | None:
+        if "|" not in key_text:
+            return None
+        node_id, field_name = key_text.split("|", 1)
+        if not node_id or not field_name:
+            return None
+        return node_id, field_name
 
     @property
     def selected_workflow(self) -> WorkflowInfo | None:
@@ -365,7 +536,7 @@ class ComfyHelperApp(App[None]):
         self.mode = "input"
         self.active_workflow = workflow
         self.active_field_index = 0
-        self.active_values = self.prefill_values_from_last_workflow(workflow)
+        self.active_values, self.active_value_sources = await self.prefill_values_from_last_workflow(workflow)
         self.batch_after_input = batch
         self.input_error = None
         self.clear_completion()
@@ -413,6 +584,7 @@ class ComfyHelperApp(App[None]):
         if workflow is None:
             return False
         field = workflow.fields[self.active_field_index]
+        field_key = (field.node_id, field.name)
         if value_text:
             try:
                 value = await self.parse_field_value(field, value_text)
@@ -421,7 +593,10 @@ class ComfyHelperApp(App[None]):
                 self.input_error = str(exc)
                 self.render_all()
                 return False
-            self.active_values[(field.node_id, field.name)] = value
+            self.active_values[field_key] = value
+            if field.is_load_image:
+                source_path = str(Path(value_text).expanduser().resolve())
+                self.active_value_sources[field_key] = source_path
         self.input_error = None
         self.clear_completion()
         return True
@@ -549,6 +724,7 @@ class ComfyHelperApp(App[None]):
         self.active_workflow = None
         self.active_field_index = 0
         self.active_values = {}
+        self.active_value_sources = {}
         self.batch_after_input = False
         self.input_error = None
         self.clear_completion()
@@ -621,7 +797,10 @@ class ComfyHelperApp(App[None]):
             self.add_message(
                 f"Submitted {workflow.name} {len(submitted)} times, first prompt_id {submitted[0]}, last {submitted[-1]}"
             )
-        self.workflow_last_values[workflow.name] = copy.deepcopy(values)
+        workflow_key = self.workflow_history_key(workflow)
+        self.workflow_last_values[workflow_key] = copy.deepcopy(values)
+        self.workflow_last_sources[workflow_key] = self.serialize_history_sources(workflow, values)
+        self.save_workflow_history(workflow, self.workflow_last_sources[workflow_key])
         self.last_submission = LastSubmission(workflow_name=workflow.name, values=dict(values), count=count)
         await self.refresh_status()
         self.render_all()

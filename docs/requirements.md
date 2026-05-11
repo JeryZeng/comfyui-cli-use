@@ -61,6 +61,12 @@ Rules:
 - No strict range is enforced for `refresh_interval`.
 - `comfyui_dir` is optional. If set, `LoadImage.image` files are copied into `comfyui_dir/input` before submission.
 
+Workflow history:
+
+- Per-workflow last values are stored under `./data/workflow_history`.
+- History files are formatted JSON.
+- `data/` is ignored by git.
+
 ## Logging
 
 Write logs to:
