@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-
 SUPPORTED_TYPES = (str, int, float, bool)
 
 
@@ -73,7 +72,7 @@ def scan_workflows(workflow_dir: Path) -> tuple[list[WorkflowInfo], list[str]]:
 
 
 def validate_workflow(
-    name: str, path: Path, modified: float, data: Any
+        name: str, path: Path, modified: float, data: Any
 ) -> WorkflowInfo:
     if not isinstance(data, dict):
         return _invalid(name, path, modified, "Top-level workflow JSON must be an object.")

@@ -100,6 +100,7 @@ class ComfyHelperApp(App[None]):
         self.client_id = str(uuid.uuid4())
         self.runtime = RuntimeState()
         self.workflows: list[WorkflowInfo] = []
+        self.workflow_last_values: dict[str, dict[tuple[str, str], Any] | None] = {}
         self.workflow_index = 0
         self.pending_index = 0
         self.focus_area = "top"
@@ -318,7 +319,8 @@ class ComfyHelperApp(App[None]):
         self.mode = "input"
         self.active_workflow = workflow
         self.active_field_index = 0
-        self.active_values = {}
+        last_values = self.workflow_last_values.get(workflow.name, None)
+        self.active_values = last_values.copy() if last_values else {}
         self.batch_after_input = batch
         self.input_error = None
         self.clear_completion()
@@ -511,6 +513,7 @@ class ComfyHelperApp(App[None]):
             self.render_all()
             return
         submitted: list[str] = []
+        self.workflow_last_values[workflow.name] = values.copy()
         for index in range(count):
             prompt_id = str(uuid.uuid4())
             try:
