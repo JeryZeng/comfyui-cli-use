@@ -7,8 +7,8 @@ import logging
 import os
 import secrets
 import uuid
-from datetime import datetime
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -29,7 +29,6 @@ from comfyui_helper.workflow import (
     collect_execution_nodes,
     scan_workflows,
 )
-
 
 MIN_WIDTH = 78
 MIN_HEIGHT = 24
@@ -252,6 +251,7 @@ class ComfyHelperApp(App[None]):
             self.add_message(f"Previous workflow is unavailable: {last.workflow_name}")
             self.render_all()
             return
+        logging.info(f"repeat submit {last.count} tasks of workflow {last.workflow_name}")
         await self.submit_workflow(workflow, dict(last.values), count=last.count)
 
     async def action_clear_pending(self) -> None:
@@ -513,10 +513,10 @@ class ComfyHelperApp(App[None]):
         param_input.add_class("hidden")
 
     async def submit_workflow(
-        self,
-        workflow: WorkflowInfo,
-        values: dict[tuple[str, str], Any],
-        count: int = 1,
+            self,
+            workflow: WorkflowInfo,
+            values: dict[tuple[str, str], Any],
+            count: int = 1,
     ) -> None:
         if workflow.data is None:
             self.add_message("Workflow data is not available.")
@@ -992,7 +992,8 @@ class ComfyHelperApp(App[None]):
             prompt_id = item[1]
             prompt = item[2]
             outputs_to_execute = item[4]
-            if not isinstance(prompt_id, str) or not isinstance(prompt, dict) or not isinstance(outputs_to_execute, list):
+            if not isinstance(prompt_id, str) or not isinstance(prompt, dict) or not isinstance(outputs_to_execute,
+                                                                                                list):
                 continue
             nodes = collect_execution_nodes(prompt, [node for node in outputs_to_execute if isinstance(node, str)])
             if nodes:
