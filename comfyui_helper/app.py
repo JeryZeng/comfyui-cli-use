@@ -176,25 +176,12 @@ class ComfyHelperApp(App[None]):
             return
 
         key = event.key
-        # logging.debug("key=%s event trigger", key)
-        # if key == "q":
-        #     await self.request_quit()
-        # elif key == "r":
-        #     self.reload_workflows()
-        #     self.render_all()
-        # elif key == "s":
-        #     await self.refresh_status()
-        #     self.render_all()
-        # elif key == "i":
-        #     await self.action_interrupt()
-        # elif key == "c":
-        #     await self.action_clear_pending()
-        # elif key == "d":
-        #     await self.action_delete_pending()
-        # elif key == "b":
-        #     await self.start_selected_workflow(batch=True)
-        # elif key == "u":
-        #     await self.action_repeat_last_submission()
+        binding_keys = {
+            binding.key if hasattr(binding, "key") else binding[0]
+            for binding in self.BINDINGS
+        }
+        if key in binding_keys:
+            return
         if key == "tab":
             self.focus_area = "bottom" if self.focus_area == "top" else "top"
             self.render_all()
