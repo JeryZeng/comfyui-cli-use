@@ -562,6 +562,8 @@ class ComfyHelperApp(App[None]):
             self.clear_completion()
             return
         expanded = str(Path(raw).expanduser())
+        if Path(expanded).exists() and Path(expanded).is_dir():
+            expanded = expanded + "/"
         matches = sorted(glob.glob(expanded + "*"))
         if not matches:
             self.input_error = "No path completion matches."
