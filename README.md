@@ -32,7 +32,11 @@ Default config:
 ```yaml
 workflow_dir: ./workflows
 refresh_interval: 1.0
+# comfyui_dir: /root/ComfyUI
 ```
+
+If `comfyui_dir` is set, `LoadImage` files are copied into `comfyui_dir/input` before submission.
+Directory inputs are expanded into one prompt per image file.
 
 ComfyUI is expected at:
 

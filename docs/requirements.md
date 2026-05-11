@@ -48,6 +48,7 @@ Default config:
 ```yaml
 workflow_dir: ./workflows
 refresh_interval: 1.0
+# comfyui_dir: /root/ComfyUI
 ```
 
 Rules:
@@ -58,6 +59,7 @@ Rules:
 - `workflow_dir` relative paths are resolved from the current working directory.
 - `refresh_interval` is in seconds and may be a float.
 - No strict range is enforced for `refresh_interval`.
+- `comfyui_dir` is optional. If set, `LoadImage.image` files are copied into `comfyui_dir/input` before submission.
 
 ## Logging
 
@@ -204,14 +206,14 @@ Special case:
 
 Behavior:
 
-- The field accepts a local file path.
+- The field accepts a local file path or a directory path.
 - Tab completion is supported for paths.
 - No extension filtering.
-- If user enters a new path, it must exist and be a file.
+- If user enters a new path, it must exist.
 - Direct Enter keeps the current workflow value and does not validate it as a local file.
-- Directory paths are rejected.
-- After processing a local path, the UI shows the final ComfyUI-recognized filename, not the full local path.
-- The implementation detail for making ComfyUI recognize the file is still to be confirmed.
+- If `comfyui_dir` is configured, file paths are copied into `comfyui_dir/input` and directory entries are expanded from the copied files.
+- If `comfyui_dir` is not configured, file paths are uploaded through the ComfyUI API and directory entries are uploaded file by file.
+- A directory path expands to one prompt per image file in that directory.
 
 ## TUI Layout
 
@@ -318,8 +320,9 @@ Batch submission is a submit-time variant, not a separate workflow type.
 - Submitting creates `N` independent ComfyUI prompts.
 - Each prompt gets a unique client-generated `prompt_id`.
 - The same resolved workflow parameters are used for every prompt.
+- If `LoadImage.image` is a directory, it expands to one prompt per image file.
 - If an integer field was set to `:seed`, that field is re-randomized before every prompt submission.
-- If a `LoadImage.image` value was changed, the image is uploaded once during guided input and the returned ComfyUI image name is reused for every prompt in the batch.
+- If a `LoadImage.image` value was changed to a file, the local file is prepared once during guided input and the final ComfyUI image name is reused for every prompt in the batch.
 - If one submission fails, already submitted prompts remain queued and the app reports how many were submitted before the failure.
 
 Boolean parsing accepts:
@@ -500,7 +503,7 @@ Keyboard help:
 Resolved for the first implementation:
 
 1. TUI framework: Textual.
-2. `LoadImage.image` local files: upload through `POST /upload/image`.
+2. `LoadImage.image` local files: copy into `comfyui_dir/input` when `comfyui_dir` is configured; otherwise upload through `POST /upload/image`. Directory inputs expand to one prompt per image file.
 3. API paths: bare ComfyUI paths such as `/prompt`, `/queue`, `/ws`.
 4. Progress: WebSocket for current-session task progress plus `/queue` polling for global queue state.
 5. Prompt identity: generate UUID `prompt_id` client-side and submit with a session `client_id`.

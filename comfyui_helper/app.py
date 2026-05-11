@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import glob
 import json
 import logging
 import os
+import shutil
 import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable, AnyStr
+from typing import Any, Awaitable, Callable
 
 import websockets
 from rich.markup import escape
@@ -42,8 +44,8 @@ class RandomSeedValue:
 
 @dataclass(frozen=True)
 class ImageBatch:
-    dir: str
-    images: list[AnyStr]
+    source: str
+    images: list[str]
 
 
 @dataclass(frozen=True)
@@ -106,7 +108,6 @@ class ComfyHelperApp(App[None]):
         self.client_id = str(uuid.uuid4())
         self.runtime = RuntimeState()
         self.workflows: list[WorkflowInfo] = []
-        self.workflow_last_values: dict[str, dict[tuple[str, str], Any] | None] = {}
         self.workflow_index = 0
         self.pending_index = 0
         self.focus_area = "top"
@@ -123,7 +124,9 @@ class ComfyHelperApp(App[None]):
         self.session_tasks: dict[str, str] = {}
         self.session_total_nodes: dict[str, int] = {}
         self.session_executed_nodes: dict[str, set[str]] = {}
+        self.session_cached_nodes: dict[str, set[str]] = {}
         self.session_finished: set[str] = set()
+        self.workflow_last_values: dict[str, dict[tuple[str, str], Any]] = {}
         self.last_submission: LastSubmission | None = None
         self._tasks: list[asyncio.Task[Any]] = []
         self.spinner_index = 0
@@ -138,7 +141,10 @@ class ComfyHelperApp(App[None]):
             yield Static(id="bottom")
 
     async def on_mount(self) -> None:
-        self.query_one("#param_input", Input).add_class("hidden")
+        param_input = self.query_one("#param_input", Input)
+        param_input.add_class("hidden")
+        param_input.can_focus = False
+        self.set_focus(None)
         for message in self.config.messages:
             self.add_message(message)
         self.reload_workflows()
@@ -183,11 +189,39 @@ class ComfyHelperApp(App[None]):
             return
 
         key = event.key
-        binding_keys = {
-            binding.key if hasattr(binding, "key") else binding[0]
-            for binding in self.BINDINGS
-        }
-        if key in binding_keys:
+        if key == "q":
+            await self.request_quit()
+            event.stop()
+            return
+        if key == "r":
+            self.reload_workflows()
+            self.render_all()
+            event.stop()
+            return
+        if key == "s":
+            await self.refresh_status()
+            self.render_all()
+            event.stop()
+            return
+        if key == "i":
+            await self.action_interrupt()
+            event.stop()
+            return
+        if key == "c":
+            await self.action_clear_pending()
+            event.stop()
+            return
+        if key == "d":
+            await self.action_delete_pending()
+            event.stop()
+            return
+        if key == "b":
+            await self.start_selected_workflow(batch=True)
+            event.stop()
+            return
+        if key == "u":
+            await self.action_repeat_last_submission()
+            event.stop()
             return
         if key == "tab":
             self.focus_area = "bottom" if self.focus_area == "top" else "top"
@@ -285,6 +319,12 @@ class ComfyHelperApp(App[None]):
     def find_workflow_by_name(self, name: str) -> WorkflowInfo | None:
         return next((workflow for workflow in self.workflows if workflow.name == name), None)
 
+    def prefill_values_from_last_workflow(self, workflow: WorkflowInfo) -> dict[tuple[str, str], Any]:
+        values = self.workflow_last_values.get(workflow.name)
+        if values is None:
+            return {}
+        return copy.deepcopy(values)
+
     @property
     def selected_workflow(self) -> WorkflowInfo | None:
         if not self.workflows:
@@ -325,8 +365,7 @@ class ComfyHelperApp(App[None]):
         self.mode = "input"
         self.active_workflow = workflow
         self.active_field_index = 0
-        last_values = self.workflow_last_values.get(workflow.name, None)
-        self.active_values = last_values.copy() if last_values else {}
+        self.active_values = self.prefill_values_from_last_workflow(workflow)
         self.batch_after_input = batch
         self.input_error = None
         self.clear_completion()
@@ -345,6 +384,7 @@ class ComfyHelperApp(App[None]):
                 param_input.cursor_position = 0
                 param_input.placeholder = "Enter keeps current, :run submits now, Esc cancels"
                 param_input.remove_class("hidden")
+                param_input.can_focus = True
                 param_input.focus()
                 self.render_all()
                 return
@@ -400,25 +440,37 @@ class ComfyHelperApp(App[None]):
         self.cancel_input(render=False)
         self.show_batch_count_input(workflow, values)
 
-    async def parse_image_batch(self, value_text: str) -> str | ImageBatch:
+    async def prepare_load_image_value(self, value_text: str) -> str:
         image_path = Path(value_text).expanduser()
         if not image_path.exists():
             raise ValueError(f"File does not exist: {image_path}")
+        if image_path.is_file():
+            if self.config.comfyui_dir is None:
+                return await self.client.upload_image(image_path)
+            return await asyncio.to_thread(self.copy_image_into_comfyui_input, image_path)
+
         if not image_path.is_dir():
-            return await self.client.upload_image(image_path)
-        # only one batch valid
-        image_batch = glob.glob(os.path.join(image_path, "*"), recursive=False)
-        image_batch = list(filter(lambda x: x.endswith((".png", ".jpg", ".jpeg", ".webp")) and Path(x).is_file(),
-                                  image_batch))
-        if len(image_batch) == 0:
-            raise ValueError(f"No valid image files found in dir:{value_text}")
-        if len(image_batch) == 1:
-            return await self.client.upload_image(Path(image_batch[0]))
-        return ImageBatch(images=[await self.client.upload_image(Path(x)) for x in image_batch], dir=str(image_path))
+            raise ValueError(f"Expected a file or directory path, got: {image_path}")
+
+        image_files = self.collect_image_files(image_path)
+        if not image_files:
+            raise ValueError(f"No valid image files found in dir: {image_path}")
+
+        if len(image_files) == 1:
+            image_file = image_files[0]
+            if self.config.comfyui_dir is None:
+                return await self.client.upload_image(image_file)
+            return await asyncio.to_thread(self.copy_image_into_comfyui_input, image_file)
+
+        if self.config.comfyui_dir is None:
+            images = [await self.client.upload_image(path) for path in image_files]
+        else:
+            images = [await asyncio.to_thread(self.copy_image_into_comfyui_input, path) for path in image_files]
+        return ImageBatch(source=str(image_path), images=images)
 
     async def parse_field_value(self, field: ConfigField, value_text: str) -> Any:
         if field.is_load_image:
-            return await self.parse_image_batch(value_text)
+            return await self.prepare_load_image_value(value_text)
 
         current = field.value
         if isinstance(current, bool):
@@ -466,6 +518,7 @@ class ComfyHelperApp(App[None]):
         param_input.cursor_position = 0
         param_input.placeholder = "Batch count, positive integer"
         param_input.remove_class("hidden")
+        param_input.can_focus = True
         param_input.focus()
         self.render_all()
 
@@ -519,6 +572,8 @@ class ComfyHelperApp(App[None]):
         param_input = self.query_one("#param_input", Input)
         param_input.value = ""
         param_input.add_class("hidden")
+        param_input.can_focus = False
+        self.set_focus(None)
 
     async def submit_workflow(
             self,
@@ -531,20 +586,18 @@ class ComfyHelperApp(App[None]):
             self.render_all()
             return
         submitted: list[str] = []
-        self.workflow_last_values[workflow.name] = values.copy()
-        total_submit_counts = 0
         for index in range(count):
-            image_values_batch = self.resolve_submission_values(values)
-            for image_batch_index in range(len(image_values_batch)):
+            resolved_values_list = self.resolve_submission_values(values)
+            for batch_index, resolved_values in enumerate(resolved_values_list):
                 prompt_id = str(uuid.uuid4())
                 try:
-                    prompt = apply_field_values(workflow.data, image_values_batch[image_batch_index])
+                    prompt = apply_field_values(workflow.data, resolved_values)
                     await self.client.submit(prompt, self.client_id, prompt_id)
                 except Exception as exc:
                     logging.exception("Failed to submit workflow %s", workflow.name)
                     self.add_message(f"Submit failed for {workflow.name}: {short_error(exc)}")
                     if submitted:
-                        self.add_message(f"Submitted {len(submitted)}/{count} before failure.")
+                        self.add_message(f"Submitted {len(submitted)}/{count * len(resolved_values_list)} before failure.")
                     await self.refresh_status()
                     self.render_all()
                     return
@@ -553,22 +606,22 @@ class ComfyHelperApp(App[None]):
                 self.session_executed_nodes[prompt_id] = set()
                 self.session_finished.discard(prompt_id)
                 submitted.append(prompt_id)
-                total_submit_counts = total_submit_counts + 1
                 logging.info(
-                    "Submitted workflow %s prompt_id=%s image_batch_index=%s/%s batch_index=%s/%s",
+                    "Submitted workflow %s prompt_id=%s batch_index=%s/%s image_batch_index=%s/%s",
                     workflow.name,
                     prompt_id,
-                    image_batch_index + 1,
-                    len(image_values_batch),
                     index + 1,
                     count,
+                    batch_index + 1,
+                    len(resolved_values_list),
                 )
-        if total_submit_counts == 1:
+        if len(submitted) == 1:
             self.add_message(f"Submitted {workflow.name}, prompt_id {submitted[0]}")
         else:
             self.add_message(
-                f"Submitted {workflow.name} {total_submit_counts} times, first prompt_id {submitted[0]}, last {submitted[-1]}"
+                f"Submitted {workflow.name} {len(submitted)} times, first prompt_id {submitted[0]}, last {submitted[-1]}"
             )
+        self.workflow_last_values[workflow.name] = copy.deepcopy(values)
         self.last_submission = LastSubmission(workflow_name=workflow.name, values=dict(values), count=count)
         await self.refresh_status()
         self.render_all()
@@ -610,40 +663,77 @@ class ComfyHelperApp(App[None]):
         self.input_error = None
         self.render_all()
 
+    def copy_image_into_comfyui_input(self, image_path: Path) -> str:
+        comfyui_dir = self.config.comfyui_dir
+        if comfyui_dir is None:
+            raise ValueError("ComfyUI directory is not configured.")
+        input_dir = (comfyui_dir / "input").resolve()
+        input_dir.mkdir(parents=True, exist_ok=True)
+
+        source = image_path.expanduser().resolve()
+        if source == input_dir or source.is_relative_to(input_dir):
+            if source.is_dir():
+                raise ValueError(f"Expected a file path, got directory inside input: {source}")
+            return source.relative_to(input_dir).as_posix()
+        source_size = source.stat().st_size
+
+        target = input_dir / source.name
+        if target.exists():
+            if target.is_file() and target.stat().st_size == source_size:
+                return target.relative_to(input_dir).as_posix()
+            stem = source.stem
+            suffix = source.suffix
+            index = 1
+            while True:
+                candidate_name = f"{stem}_{index}{suffix}"
+                candidate = input_dir / candidate_name
+                if not candidate.exists():
+                    shutil.copy2(source, candidate)
+                    return candidate.relative_to(input_dir).as_posix()
+                index += 1
+
+        shutil.copy2(source, target)
+        return target.relative_to(input_dir).as_posix()
+
+    def collect_image_files(self, image_dir: Path) -> list[Path]:
+        image_files: list[Path] = []
+        for path in sorted(image_dir.iterdir()):
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
+                continue
+            image_files.append(path)
+        return image_files
+
     def resolve_submission_values(self, values: dict[tuple[str, str], Any]) -> list[dict[tuple[str, str], Any]]:
         batch: tuple[tuple[str, str], ImageBatch] | None = None
         for key, value in values.items():
             if isinstance(value, ImageBatch):
-                if not batch:
-                    batch = (key, value)
-                else:
-                    raise Exception("multi image batch not allowed")
+                if batch is not None:
+                    raise ValueError("Only one LoadImage directory can be expanded at a time.")
+                batch = (key, value)
 
+        if batch is None:
+            return [self.resolve_single_submission_values(values)]
+
+        field_key, image_batch = batch
         result: list[dict[tuple[str, str], Any]] = []
-        if not batch:
-            resolved: dict[tuple[str, str], Any] = {}
-            for key, value in values.items():
-                if isinstance(value, RandomSeedValue):
-                    resolved[key] = secrets.randbits(63)
-                elif isinstance(value, ImageBatch):
-                    resolved[key] = secrets.randbits(63)
-                else:
-                    resolved[key] = value
+        for image in image_batch.images:
+            resolved = self.resolve_single_submission_values(values)
+            resolved[field_key] = image
             result.append(resolved)
-        else:
-            field = batch[0]
-            for image in batch[1].images:
-                resolved: dict[tuple[str, str], Any] = {}
-                for key, value in values.items():
-                    if key == field:
-                        resolved[key] = image
-                        continue
-                    if isinstance(value, RandomSeedValue):
-                        resolved[key] = secrets.randbits(63)
-                    else:
-                        resolved[key] = value
-                result.append(resolved)
         return result
+
+    def resolve_single_submission_values(self, values: dict[tuple[str, str], Any]) -> dict[tuple[str, str], Any]:
+        resolved: dict[tuple[str, str], Any] = {}
+        for key, value in values.items():
+            if isinstance(value, RandomSeedValue):
+                resolved[key] = secrets.randbits(63)
+            elif isinstance(value, ImageBatch):
+                resolved[key] = value
+            else:
+                resolved[key] = value
+        return resolved
 
     async def poll_loop(self) -> None:
         while True:
@@ -727,13 +817,13 @@ class ComfyHelperApp(App[None]):
         elif event_type == "executed" and isinstance(prompt_id, str):
             node = data.get("node")
             if isinstance(node, str):
-                self.session_executed_nodes.setdefault(prompt_id, set()).add(node)
+                self.mark_node_completed(prompt_id, node)
         elif event_type == "execution_cached" and isinstance(prompt_id, str):
             cached_nodes = data.get("nodes", [])
             if isinstance(cached_nodes, list):
                 for node in cached_nodes:
                     if isinstance(node, str):
-                        self.session_executed_nodes.setdefault(prompt_id, set()).add(node)
+                        self.mark_cached_node(prompt_id, node)
         elif event_type == "execution_error" and isinstance(prompt_id, str):
             self.mark_recent(prompt_id, "failed")
             message_text = data.get("exception_message") or data.get("exception_type") or "Execution failed."
@@ -918,7 +1008,10 @@ class ComfyHelperApp(App[None]):
         if isinstance(field.value, int) and not isinstance(field.value, bool):
             lines.append("Use :seed for a new random integer on every submission.")
         if field.is_load_image:
-            lines.append("LoadImage.image expects a local file path. Tab completes paths.")
+            if self.config.comfyui_dir is None:
+                lines.append("LoadImage.image accepts a local file or directory. Tab completes paths.")
+            else:
+                lines.append("LoadImage.image file or directory will be copied into ComfyUI input. Tab completes paths.")
         if self.input_error:
             lines.append(f"[red]{escape(self.input_error)}[/]")
         if self.completion_matches:
@@ -1007,7 +1100,9 @@ class ComfyHelperApp(App[None]):
         if prompt_id in self.session_finished:
             return 100
 
-        done = len(self.session_executed_nodes.get(prompt_id, set()))
+        done_nodes = set(self.session_executed_nodes.get(prompt_id, set()))
+        done_nodes.update(self.session_cached_nodes.get(prompt_id, set()))
+        done = len(done_nodes)
         fraction = self.node_progress_fraction(prompt_id)
         return max(0, min(100, int(((done + fraction) / total) * 100)))
 
@@ -1042,6 +1137,12 @@ class ComfyHelperApp(App[None]):
             if nodes:
                 self.session_total_nodes[prompt_id] = len(nodes)
 
+    def mark_node_completed(self, prompt_id: str, node_id: str) -> None:
+        self.session_executed_nodes.setdefault(prompt_id, set()).add(node_id)
+
+    def mark_cached_node(self, prompt_id: str, node_id: str) -> None:
+        self.session_cached_nodes.setdefault(prompt_id, set()).add(node_id)
+
     def help_text(self) -> str:
         if self.confirm_message:
             return "Enter/y confirm | Esc/n cancel"
@@ -1074,7 +1175,7 @@ def format_field_value(value: Any) -> str:
     if isinstance(value, RandomSeedValue):
         return ":seed (random each submit)"
     if isinstance(value, ImageBatch):
-        return f"{len(value.images)} images batch (dir:{value.dir})"
+        return f"{len(value.images)} images from {value.source}"
     return str(value)
 
 
