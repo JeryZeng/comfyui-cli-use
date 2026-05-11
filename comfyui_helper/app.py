@@ -408,8 +408,8 @@ class ComfyHelperApp(App[None]):
             return await self.client.upload_image(image_path)
         # only one batch valid
         image_batch = glob.glob(os.path.join(image_path, "*"), recursive=False)
-        image_batch = filter(lambda x: x.endswith((".png", ".jpg", ".jpeg", ".webp")) and Path(x).is_file(),
-                             image_batch)
+        image_batch = list(filter(lambda x: x.endswith((".png", ".jpg", ".jpeg", ".webp")) and Path(x).is_file(),
+                                  image_batch))
         if len(image_batch) == 0:
             raise ValueError(f"No valid image files found in dir:{value_text}")
         if len(image_batch) == 1:
