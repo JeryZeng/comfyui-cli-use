@@ -176,6 +176,7 @@ class ComfyHelperApp(App[None]):
             return
 
         key = event.key
+        logging.debug("key=%s event trigger", key)
         if key == "q":
             await self.request_quit()
         elif key == "r":
