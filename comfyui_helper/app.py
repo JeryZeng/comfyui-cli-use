@@ -10,7 +10,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, AnyStr
 
 import websockets
 from rich.markup import escape
@@ -38,6 +38,12 @@ SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇",
 @dataclass(frozen=True)
 class RandomSeedValue:
     pass
+
+
+@dataclass(frozen=True)
+class ImageBatch:
+    dir: str
+    images: list[AnyStr]
 
 
 @dataclass(frozen=True)
@@ -393,14 +399,25 @@ class ComfyHelperApp(App[None]):
         self.cancel_input(render=False)
         self.show_batch_count_input(workflow, values)
 
+    async def parse_image_batch(self, value_text: str) -> str | ImageBatch:
+        image_path = Path(value_text).expanduser()
+        if not image_path.exists():
+            raise ValueError(f"File does not exist: {image_path}")
+        if not image_path.is_dir():
+            return await self.client.upload_image(image_path)
+        # only one batch valid
+        image_batch = glob.glob(os.path.join(image_path, "*"), recursive=False)
+        image_batch = filter(lambda x: x.endswith((".png", ".jpg", ".jpeg", ".webp")) and Path(x).is_file(),
+                             image_batch)
+        if len(image_batch) == 0:
+            raise ValueError(f"No valid image files found in dir:{value_text}")
+        if len(image_batch) == 1:
+            return await self.client.upload_image(image_batch[0])
+        return ImageBatch(images=[await self.client.upload_image(x) for x in image_batch], dir=str(image_path))
+
     async def parse_field_value(self, field: ConfigField, value_text: str) -> Any:
         if field.is_load_image:
-            path = Path(value_text).expanduser()
-            if not path.exists():
-                raise ValueError(f"File does not exist: {path}")
-            if not path.is_file():
-                raise ValueError(f"Expected a file path, not a directory: {path}")
-            return await self.client.upload_image(path)
+            return await self.parse_image_batch(value_text)
 
         current = field.value
         if isinstance(current, bool):
@@ -514,36 +531,42 @@ class ComfyHelperApp(App[None]):
             return
         submitted: list[str] = []
         self.workflow_last_values[workflow.name] = values.copy()
+        total_submit_counts = 0
         for index in range(count):
-            prompt_id = str(uuid.uuid4())
-            try:
-                prompt = apply_field_values(workflow.data, self.resolve_submission_values(values))
-                await self.client.submit(prompt, self.client_id, prompt_id)
-            except Exception as exc:
-                logging.exception("Failed to submit workflow %s", workflow.name)
-                self.add_message(f"Submit failed for {workflow.name}: {short_error(exc)}")
-                if submitted:
-                    self.add_message(f"Submitted {len(submitted)}/{count} before failure.")
-                await self.refresh_status()
-                self.render_all()
-                return
-            self.session_tasks[prompt_id] = workflow.name
-            self.session_total_nodes[prompt_id] = len(workflow.data)
-            self.session_executed_nodes[prompt_id] = set()
-            self.session_finished.discard(prompt_id)
-            submitted.append(prompt_id)
-            logging.info(
-                "Submitted workflow %s prompt_id=%s batch_index=%s/%s",
-                workflow.name,
-                prompt_id,
-                index + 1,
-                count,
-            )
-        if count == 1:
+            image_values_batch = self.resolve_submission_values(values)
+            for image_batch_index in range(len(image_values_batch)):
+                prompt_id = str(uuid.uuid4())
+                try:
+                    prompt = apply_field_values(workflow.data, image_values_batch[image_batch_index])
+                    await self.client.submit(prompt, self.client_id, prompt_id)
+                except Exception as exc:
+                    logging.exception("Failed to submit workflow %s", workflow.name)
+                    self.add_message(f"Submit failed for {workflow.name}: {short_error(exc)}")
+                    if submitted:
+                        self.add_message(f"Submitted {len(submitted)}/{count} before failure.")
+                    await self.refresh_status()
+                    self.render_all()
+                    return
+                self.session_tasks[prompt_id] = workflow.name
+                self.session_total_nodes[prompt_id] = len(workflow.data)
+                self.session_executed_nodes[prompt_id] = set()
+                self.session_finished.discard(prompt_id)
+                submitted.append(prompt_id)
+                total_submit_counts = total_submit_counts + 1
+                logging.info(
+                    "Submitted workflow %s prompt_id=%s image_batch_index=%s/%s batch_index=%s/%s",
+                    workflow.name,
+                    prompt_id,
+                    image_batch_index + 1,
+                    len(image_values_batch),
+                    index + 1,
+                    count,
+                )
+        if total_submit_counts == 1:
             self.add_message(f"Submitted {workflow.name}, prompt_id {submitted[0]}")
         else:
             self.add_message(
-                f"Submitted {workflow.name} {count} times, first prompt_id {submitted[0]}, last {submitted[-1]}"
+                f"Submitted {workflow.name} {total_submit_counts} times, first prompt_id {submitted[0]}, last {submitted[-1]}"
             )
         self.last_submission = LastSubmission(workflow_name=workflow.name, values=dict(values), count=count)
         await self.refresh_status()
@@ -586,14 +609,40 @@ class ComfyHelperApp(App[None]):
         self.input_error = None
         self.render_all()
 
-    def resolve_submission_values(self, values: dict[tuple[str, str], Any]) -> dict[tuple[str, str], Any]:
-        resolved: dict[tuple[str, str], Any] = {}
+    def resolve_submission_values(self, values: dict[tuple[str, str], Any]) -> list[dict[tuple[str, str], Any]]:
+        batch: tuple[tuple[str, str], ImageBatch] | None = None
         for key, value in values.items():
-            if isinstance(value, RandomSeedValue):
-                resolved[key] = secrets.randbits(63)
-            else:
-                resolved[key] = value
-        return resolved
+            if isinstance(value, ImageBatch):
+                if not batch:
+                    batch = (key, value)
+                else:
+                    raise Exception("multi image batch not allowed")
+
+        result: list[dict[tuple[str, str], Any]] = []
+        if not batch:
+            resolved: dict[tuple[str, str], Any] = {}
+            for key, value in values.items():
+                if isinstance(value, RandomSeedValue):
+                    resolved[key] = secrets.randbits(63)
+                elif isinstance(value, ImageBatch):
+                    resolved[key] = secrets.randbits(63)
+                else:
+                    resolved[key] = value
+            result.append(resolved)
+        else:
+            field = batch[0]
+            for image in batch[1].images:
+                resolved: dict[tuple[str, str], Any] = {}
+                for key, value in values.items():
+                    if key == field:
+                        resolved[key] = image
+                        continue
+                    if isinstance(value, RandomSeedValue):
+                        resolved[key] = secrets.randbits(63)
+                    else:
+                        resolved[key] = value
+                result.append(resolved)
+        return result
 
     async def poll_loop(self) -> None:
         while True:
@@ -1023,6 +1072,8 @@ def color_count(value: int, color: str) -> str:
 def format_field_value(value: Any) -> str:
     if isinstance(value, RandomSeedValue):
         return ":seed (random each submit)"
+    if isinstance(value, ImageBatch):
+        return f"{len(value.images)} images batch (dir:{value.dir})"
     return str(value)
 
 
