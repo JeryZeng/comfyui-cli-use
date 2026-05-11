@@ -39,6 +39,7 @@ If `comfyui_dir` is set, `LoadImage` files are copied into `comfyui_dir/input` b
 Directory inputs are expanded into one prompt per image file.
 
 The app stores per-workflow history under `./data/workflow_history` as formatted JSON.
+Normal values are stored directly. `:seed` is saved as a random-seed marker, and `LoadImage` directory batches are saved as `image_batch` records with the original directory path.
 
 ComfyUI is expected at:
 

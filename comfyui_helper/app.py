@@ -117,11 +117,9 @@ class ComfyHelperApp(App[None]):
         self.active_workflow: WorkflowInfo | None = None
         self.active_field_index = 0
         self.active_values: dict[tuple[str, str], Any] = {}
-        self.active_value_sources: dict[tuple[str, str], str] = {}
         self.batch_after_input = False
         self.batch_workflow: WorkflowInfo | None = None
         self.batch_values: dict[tuple[str, str], Any] = {}
-        self.batch_value_sources: dict[tuple[str, str], str] = {}
         self.confirm_message: str | None = None
         self.confirm_callback: Callable[[], Awaitable[None]] | None = None
         self.quit_confirm_pending = False
@@ -131,7 +129,6 @@ class ComfyHelperApp(App[None]):
         self.session_cached_nodes: dict[str, set[str]] = {}
         self.session_finished: set[str] = set()
         self.workflow_last_values: dict[str, dict[tuple[str, str], Any]] = {}
-        self.workflow_last_sources: dict[str, dict[tuple[str, str], str]] = {}
         self.workflow_history_raw: dict[str, dict[str, Any]] = {}
         self.workflow_history_dir = Path.cwd() / "data" / "workflow_history"
         self.last_submission: LastSubmission | None = None
@@ -289,11 +286,9 @@ class ComfyHelperApp(App[None]):
             self.render_all()
             return
         logging.info(f"repeat submit {last.count} tasks of workflow {last.workflow_name}")
-        workflow_key = self.workflow_history_key(workflow)
         await self.submit_workflow(
             workflow,
-            dict(last.values),
-            copy.deepcopy(self.workflow_last_sources.get(workflow_key, {})),
+            copy.deepcopy(last.values),
             count=last.count,
         )
 
@@ -357,33 +352,30 @@ class ComfyHelperApp(App[None]):
 
     async def prefill_values_from_last_workflow(
             self, workflow: WorkflowInfo
-    ) -> tuple[dict[tuple[str, str], Any], dict[tuple[str, str], str]]:
+    ) -> dict[tuple[str, str], Any]:
         workflow_key = self.workflow_history_key(workflow)
         values = self.workflow_last_values.get(workflow_key)
-        serialized = self.workflow_last_sources.get(workflow_key)
-        if values is not None and serialized is not None:
-            return copy.deepcopy(values), self.extract_active_value_sources(workflow, serialized)
+        if values is not None:
+            return copy.deepcopy(values)
 
         raw_history = self.workflow_history_raw.get(workflow_key)
         if raw_history is None:
-            return {}, {}
-        resolved, resolved_sources = await self.resolve_history_values(workflow, raw_history)
+            return {}
+        resolved = await self.resolve_history_values(workflow, raw_history)
         self.workflow_last_values[workflow_key] = copy.deepcopy(resolved)
-        self.workflow_last_sources[workflow_key] = copy.deepcopy(resolved_sources)
-        return copy.deepcopy(resolved), copy.deepcopy(resolved_sources)
+        return copy.deepcopy(resolved)
 
     async def resolve_history_values(
             self,
             workflow: WorkflowInfo,
             raw_history: dict[str, Any],
-    ) -> tuple[dict[tuple[str, str], Any], dict[tuple[str, str], str]]:
+    ) -> dict[tuple[str, str], Any]:
         values = raw_history.get("values", {})
         if not isinstance(values, dict):
-            return {}, {}
+            return {}
 
         field_lookup = {(field.node_id, field.name): field for field in workflow.fields}
         resolved_values: dict[tuple[str, str], Any] = {}
-        resolved_sources: dict[tuple[str, str], str] = {}
 
         for key_text, raw_value in values.items():
             field_key = self.deserialize_field_key(key_text)
@@ -401,18 +393,19 @@ class ComfyHelperApp(App[None]):
             if value is None:
                 continue
             resolved_values[field_key] = value
-            if field.is_load_image and isinstance(raw_value, dict):
-                source = raw_value.get("path")
-                if isinstance(source, str):
-                    resolved_sources[field_key] = source
 
-        return resolved_values, resolved_sources
+        return resolved_values
 
     async def deserialize_history_value(self, field: ConfigField, raw_value: Any) -> Any | None:
         if isinstance(raw_value, dict):
             value_type = raw_value.get("type")
             if value_type == "random_seed":
                 return RandomSeedValue()
+            if value_type == "image_batch":
+                source = raw_value.get("dir")
+                if not isinstance(source, str) or not source.strip():
+                    return None
+                return await self.prepare_load_image_value(source)
             if value_type in {"load_image_file", "load_image_dir"}:
                 source = raw_value.get("path")
                 if not isinstance(source, str) or not source.strip():
@@ -420,60 +413,25 @@ class ComfyHelperApp(App[None]):
                 return await self.prepare_load_image_value(source)
             return None
         if field.is_load_image:
-            source = raw_value
-            if not isinstance(source, str) or not source.strip():
+            if not isinstance(raw_value, str) or not raw_value.strip():
                 return None
-            return await self.prepare_load_image_value(source)
+            return raw_value
         return raw_value
 
-    def serialize_history_sources(
+    def serialize_history_values(
             self,
-            workflow: WorkflowInfo,
             values: dict[tuple[str, str], Any],
-            sources: dict[tuple[str, str], str],
     ) -> dict[str, Any]:
         serialized: dict[str, Any] = {}
-        field_lookup = {(field.node_id, field.name): field for field in workflow.fields}
         for field_key, value in values.items():
-            field = field_lookup.get(field_key)
-            if field is None:
-                continue
             key_text = self.serialize_field_key(field_key)
-            if field.is_load_image:
-                source = sources.get(field_key)
-                if not source:
-                    continue
-                path = Path(source)
-                serialized[key_text] = {
-                    "type": "load_image_dir" if isinstance(value, ImageBatch) or path.is_dir() else "load_image_file",
-                    "path": str(path),
-                }
-                continue
             if isinstance(value, RandomSeedValue):
                 serialized[key_text] = {"type": "random_seed"}
+            elif isinstance(value, ImageBatch):
+                serialized[key_text] = {"type": "image_batch", "dir": value.source}
             else:
                 serialized[key_text] = copy.deepcopy(value)
         return serialized
-
-    def extract_active_value_sources(
-            self,
-            workflow: WorkflowInfo,
-            serialized_values: dict[str, Any],
-    ) -> dict[tuple[str, str], str]:
-        field_lookup = {(field.node_id, field.name): field for field in workflow.fields}
-        sources: dict[tuple[str, str], str] = {}
-        for key_text, raw_value in serialized_values.items():
-            field_key = self.deserialize_field_key(key_text)
-            if field_key is None:
-                continue
-            field = field_lookup.get(field_key)
-            if field is None or not field.is_load_image:
-                continue
-            if isinstance(raw_value, dict):
-                source = raw_value.get("path")
-                if isinstance(source, str):
-                    sources[field_key] = source
-        return sources
 
     def save_workflow_history(self, workflow: WorkflowInfo, serialized_values: dict[str, Any]) -> None:
         self.workflow_history_dir.mkdir(parents=True, exist_ok=True)
@@ -545,7 +503,7 @@ class ComfyHelperApp(App[None]):
         self.mode = "input"
         self.active_workflow = workflow
         self.active_field_index = 0
-        self.active_values, self.active_value_sources = await self.prefill_values_from_last_workflow(workflow)
+        self.active_values = await self.prefill_values_from_last_workflow(workflow)
         self.batch_after_input = batch
         self.input_error = None
         self.clear_completion()
@@ -603,9 +561,6 @@ class ComfyHelperApp(App[None]):
                 self.render_all()
                 return False
             self.active_values[field_key] = value
-            if field.is_load_image:
-                source_path = str(Path(value_text).expanduser().resolve())
-                self.active_value_sources[field_key] = source_path
         self.input_error = None
         self.clear_completion()
         return True
@@ -621,12 +576,11 @@ class ComfyHelperApp(App[None]):
         if not await self.capture_current_field_value(value_text):
             return
         values = dict(self.active_values)
-        sources = copy.deepcopy(self.active_value_sources)
         self.cancel_input(render=False)
-        self.show_batch_count_input(workflow, values, sources)
+        self.show_batch_count_input(workflow, values)
 
     async def prepare_load_image_value(self, value_text: str) -> str:
-        image_path = Path(value_text).expanduser()
+        image_path = self.normalize_input_path(value_text)
         if not image_path.exists():
             raise ValueError(f"File does not exist: {image_path}")
         if image_path.is_file():
@@ -652,6 +606,12 @@ class ComfyHelperApp(App[None]):
         else:
             images = [await asyncio.to_thread(self.copy_image_into_comfyui_input, path) for path in image_files]
         return ImageBatch(source=str(image_path), images=images)
+
+    def normalize_input_path(self, value_text: str) -> Path:
+        path = Path(value_text).expanduser()
+        if path.is_absolute():
+            return path
+        return (Path.cwd() / path).absolute()
 
     async def parse_field_value(self, field: ConfigField, value_text: str) -> Any:
         if field.is_load_image:
@@ -684,25 +644,22 @@ class ComfyHelperApp(App[None]):
     async def finish_guided_input(self) -> None:
         workflow = self.active_workflow
         values = dict(self.active_values)
-        sources = copy.deepcopy(self.active_value_sources)
         batch = self.batch_after_input
         self.cancel_input(render=False)
         if workflow is not None:
             if batch:
-                self.show_batch_count_input(workflow, values, sources)
+                self.show_batch_count_input(workflow, values)
             else:
-                await self.submit_workflow(workflow, values, sources)
+                await self.submit_workflow(workflow, values)
 
     def show_batch_count_input(
             self,
             workflow: WorkflowInfo,
             values: dict[tuple[str, str], Any],
-            sources: dict[tuple[str, str], str] | None = None,
     ) -> None:
         self.mode = "batch_count"
         self.batch_workflow = workflow
         self.batch_values = values
-        self.batch_value_sources = copy.deepcopy(sources or {})
         self.input_error = None
         self.clear_completion()
         param_input = self.query_one("#param_input", Input)
@@ -732,17 +689,15 @@ class ComfyHelperApp(App[None]):
             return
         workflow = self.batch_workflow
         values = dict(self.batch_values)
-        sources = copy.deepcopy(self.batch_value_sources)
         self.cancel_batch_count(render=False)
         if workflow is not None:
-            await self.submit_workflow(workflow, values, sources, count=count)
+            await self.submit_workflow(workflow, values, count=count)
 
     def cancel_input(self, render: bool = True) -> None:
         self.mode = "browse"
         self.active_workflow = None
         self.active_field_index = 0
         self.active_values = {}
-        self.active_value_sources = {}
         self.batch_after_input = False
         self.input_error = None
         self.clear_completion()
@@ -755,7 +710,6 @@ class ComfyHelperApp(App[None]):
         self.mode = "browse"
         self.batch_workflow = None
         self.batch_values = {}
-        self.batch_value_sources = {}
         self.input_error = None
         self.clear_completion()
         self.hide_param_input()
@@ -774,7 +728,6 @@ class ComfyHelperApp(App[None]):
             self,
             workflow: WorkflowInfo,
             values: dict[tuple[str, str], Any],
-            sources: dict[tuple[str, str], str] | None = None,
             count: int = 1,
     ) -> None:
         if workflow.data is None:
@@ -816,14 +769,12 @@ class ComfyHelperApp(App[None]):
         else:
             self.add_message(
                 f"Submitted {workflow.name} {len(submitted)} times, first prompt_id {submitted[0]}, last {submitted[-1]}"
-            )
+        )
         workflow_key = self.workflow_history_key(workflow)
         self.workflow_last_values[workflow_key] = copy.deepcopy(values)
-        source_map = copy.deepcopy(sources or {})
-        self.workflow_last_sources[workflow_key] = copy.deepcopy(source_map)
-        serialized_sources = self.serialize_history_sources(workflow, values, source_map)
-        self.save_workflow_history(workflow, serialized_sources)
-        self.last_submission = LastSubmission(workflow_name=workflow.name, values=dict(values), count=count)
+        serialized_values = self.serialize_history_values(values)
+        self.save_workflow_history(workflow, serialized_values)
+        self.last_submission = LastSubmission(workflow_name=workflow.name, values=copy.deepcopy(values), count=count)
         await self.refresh_status()
         self.render_all()
 

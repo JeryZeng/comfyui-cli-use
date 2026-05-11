@@ -65,6 +65,9 @@ Workflow history:
 
 - Per-workflow last values are stored under `./data/workflow_history`.
 - History files are formatted JSON.
+- Normal values are stored directly.
+- `:seed` is stored as a random-seed marker.
+- `LoadImage` directory batches are stored as `image_batch` records with the original directory path.
 - `data/` is ignored by git.
 
 ## Logging
