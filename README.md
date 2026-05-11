@@ -11,6 +11,10 @@ python3.10 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
+## prepare workflows
+
+put `workflow-api.json(API FORMAT)` files into `./workflows`
+
 ## Run
 
 ```bash
