@@ -121,15 +121,17 @@ class ComfyHelperApp(App[None]):
         self.batch_after_input = False
         self.batch_workflow: WorkflowInfo | None = None
         self.batch_values: dict[tuple[str, str], Any] = {}
+        self.batch_value_sources: dict[tuple[str, str], str] = {}
         self.confirm_message: str | None = None
         self.confirm_callback: Callable[[], Awaitable[None]] | None = None
+        self.quit_confirm_pending = False
         self.session_tasks: dict[str, str] = {}
         self.session_total_nodes: dict[str, int] = {}
         self.session_executed_nodes: dict[str, set[str]] = {}
         self.session_cached_nodes: dict[str, set[str]] = {}
         self.session_finished: set[str] = set()
         self.workflow_last_values: dict[str, dict[tuple[str, str], Any]] = {}
-        self.workflow_last_sources: dict[str, dict[tuple[str, str], Any]] = {}
+        self.workflow_last_sources: dict[str, dict[tuple[str, str], str]] = {}
         self.workflow_history_raw: dict[str, dict[str, Any]] = {}
         self.workflow_history_dir = Path.cwd() / "data" / "workflow_history"
         self.last_submission: LastSubmission | None = None
@@ -287,7 +289,13 @@ class ComfyHelperApp(App[None]):
             self.render_all()
             return
         logging.info(f"repeat submit {last.count} tasks of workflow {last.workflow_name}")
-        await self.submit_workflow(workflow, dict(last.values), count=last.count)
+        workflow_key = self.workflow_history_key(workflow)
+        await self.submit_workflow(
+            workflow,
+            dict(last.values),
+            copy.deepcopy(self.workflow_last_sources.get(workflow_key, {})),
+            count=last.count,
+        )
 
     async def action_clear_pending(self) -> None:
         if not self.runtime.pending:
@@ -422,6 +430,7 @@ class ComfyHelperApp(App[None]):
             self,
             workflow: WorkflowInfo,
             values: dict[tuple[str, str], Any],
+            sources: dict[tuple[str, str], str],
     ) -> dict[str, Any]:
         serialized: dict[str, Any] = {}
         field_lookup = {(field.node_id, field.name): field for field in workflow.fields}
@@ -431,7 +440,7 @@ class ComfyHelperApp(App[None]):
                 continue
             key_text = self.serialize_field_key(field_key)
             if field.is_load_image:
-                source = self.active_value_sources.get(field_key)
+                source = sources.get(field_key)
                 if not source:
                     continue
                 path = Path(source)
@@ -612,8 +621,9 @@ class ComfyHelperApp(App[None]):
         if not await self.capture_current_field_value(value_text):
             return
         values = dict(self.active_values)
+        sources = copy.deepcopy(self.active_value_sources)
         self.cancel_input(render=False)
-        self.show_batch_count_input(workflow, values)
+        self.show_batch_count_input(workflow, values, sources)
 
     async def prepare_load_image_value(self, value_text: str) -> str:
         image_path = Path(value_text).expanduser()
@@ -674,18 +684,25 @@ class ComfyHelperApp(App[None]):
     async def finish_guided_input(self) -> None:
         workflow = self.active_workflow
         values = dict(self.active_values)
+        sources = copy.deepcopy(self.active_value_sources)
         batch = self.batch_after_input
         self.cancel_input(render=False)
         if workflow is not None:
             if batch:
-                self.show_batch_count_input(workflow, values)
+                self.show_batch_count_input(workflow, values, sources)
             else:
-                await self.submit_workflow(workflow, values)
+                await self.submit_workflow(workflow, values, sources)
 
-    def show_batch_count_input(self, workflow: WorkflowInfo, values: dict[tuple[str, str], Any]) -> None:
+    def show_batch_count_input(
+            self,
+            workflow: WorkflowInfo,
+            values: dict[tuple[str, str], Any],
+            sources: dict[tuple[str, str], str] | None = None,
+    ) -> None:
         self.mode = "batch_count"
         self.batch_workflow = workflow
         self.batch_values = values
+        self.batch_value_sources = copy.deepcopy(sources or {})
         self.input_error = None
         self.clear_completion()
         param_input = self.query_one("#param_input", Input)
@@ -715,9 +732,10 @@ class ComfyHelperApp(App[None]):
             return
         workflow = self.batch_workflow
         values = dict(self.batch_values)
+        sources = copy.deepcopy(self.batch_value_sources)
         self.cancel_batch_count(render=False)
         if workflow is not None:
-            await self.submit_workflow(workflow, values, count=count)
+            await self.submit_workflow(workflow, values, sources, count=count)
 
     def cancel_input(self, render: bool = True) -> None:
         self.mode = "browse"
@@ -737,6 +755,7 @@ class ComfyHelperApp(App[None]):
         self.mode = "browse"
         self.batch_workflow = None
         self.batch_values = {}
+        self.batch_value_sources = {}
         self.input_error = None
         self.clear_completion()
         self.hide_param_input()
@@ -755,6 +774,7 @@ class ComfyHelperApp(App[None]):
             self,
             workflow: WorkflowInfo,
             values: dict[tuple[str, str], Any],
+            sources: dict[tuple[str, str], str] | None = None,
             count: int = 1,
     ) -> None:
         if workflow.data is None:
@@ -799,8 +819,10 @@ class ComfyHelperApp(App[None]):
             )
         workflow_key = self.workflow_history_key(workflow)
         self.workflow_last_values[workflow_key] = copy.deepcopy(values)
-        self.workflow_last_sources[workflow_key] = self.serialize_history_sources(workflow, values)
-        self.save_workflow_history(workflow, self.workflow_last_sources[workflow_key])
+        source_map = copy.deepcopy(sources or {})
+        self.workflow_last_sources[workflow_key] = copy.deepcopy(source_map)
+        serialized_sources = self.serialize_history_sources(workflow, values, source_map)
+        self.save_workflow_history(workflow, serialized_sources)
         self.last_submission = LastSubmission(workflow_name=workflow.name, values=dict(values), count=count)
         await self.refresh_status()
         self.render_all()
@@ -1035,9 +1057,20 @@ class ComfyHelperApp(App[None]):
         self.render_all()
 
     async def handle_confirm_key(self, event: events.Key) -> None:
+        if self.quit_confirm_pending and event.key == "q":
+            callback = self.confirm_callback
+            self.confirm_message = None
+            self.confirm_callback = None
+            self.quit_confirm_pending = False
+            if callback:
+                await callback()
+            self.render_all()
+            event.stop()
+            return
         if event.key in {"escape", "n"}:
             self.confirm_message = None
             self.confirm_callback = None
+            self.quit_confirm_pending = False
             self.add_message("Operation cancelled.")
             self.render_all()
             event.stop()
@@ -1046,6 +1079,7 @@ class ComfyHelperApp(App[None]):
             callback = self.confirm_callback
             self.confirm_message = None
             self.confirm_callback = None
+            self.quit_confirm_pending = False
             if callback:
                 await callback()
             self.render_all()
@@ -1093,13 +1127,18 @@ class ComfyHelperApp(App[None]):
         await self.refresh_status()
 
     async def request_quit(self) -> None:
-        active_ids = {item.prompt_id for item in self.runtime.running + self.runtime.pending}
-        session_active = bool(active_ids.intersection(self.session_tasks))
-        if session_active:
-            await self.confirm(
-                "This session has active tasks. Quit TUI and leave them running?",
-                self.quit_app,
-            )
+        if self.confirm_message:
+            return
+        if not self.quit_confirm_pending:
+            active_ids = {item.prompt_id for item in self.runtime.running + self.runtime.pending}
+            session_active = bool(active_ids.intersection(self.session_tasks))
+            if session_active:
+                self.confirm_message = "This session has active tasks. Press q again to quit and leave them running."
+            else:
+                self.confirm_message = "Press q again to quit the TUI."
+            self.confirm_callback = self.quit_app
+            self.quit_confirm_pending = True
+            self.render_all()
             return
         await self.quit_app()
 
@@ -1122,10 +1161,11 @@ class ComfyHelperApp(App[None]):
     def render_top(self) -> str:
         border = "[bold cyan]" if self.focus_area == "top" else "[bold]"
         if self.confirm_message:
+            confirm_hint = "q/Enter/y confirm | Esc/n cancel" if self.quit_confirm_pending else "Enter/y confirm | Esc/n cancel"
             return (
                 f"{border}Operation[/]\n\n"
                 f"[yellow]{escape(self.confirm_message)}[/]\n\n"
-                "Enter/y confirm | Esc/n cancel"
+                f"{confirm_hint}"
             )
         if self.mode == "input":
             return self.render_input()
@@ -1324,7 +1364,7 @@ class ComfyHelperApp(App[None]):
 
     def help_text(self) -> str:
         if self.confirm_message:
-            return "Enter/y confirm | Esc/n cancel"
+            return "q/Enter/y confirm | Esc/n cancel" if self.quit_confirm_pending else "Enter/y confirm | Esc/n cancel"
         if self.mode == "input":
             return "Enter next | b/:batch batch | :seed random | :run submit | Tab complete | Esc cancel"
         if self.mode == "batch_count":
