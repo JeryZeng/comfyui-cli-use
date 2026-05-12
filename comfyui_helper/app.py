@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import secrets
 import shutil
 import uuid
@@ -19,7 +20,7 @@ import websockets
 from rich.markup import escape
 from textual import events
 from textual.app import App, ComposeResult
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
 from textual.widgets import Input, Static
 
 from comfyui_helper.client import ComfyClient
@@ -47,6 +48,7 @@ class RandomSeedValue:
 class ImageBatch:
     source: str
     images: list[str]
+    shuffle: bool = False
 
 
 @dataclass(frozen=True)
@@ -70,14 +72,29 @@ class ComfyHelperApp(App[None]):
         height: 1fr;
         border: round $accent;
         padding: 0 1;
+        layout: horizontal;
     }
 
-    #top_content {
+    #top_left {
+        height: 1fr;
+        width: 70%;
+        padding-right: 1;
+        layout: vertical;
+    }
+
+    #top_left_content {
         height: 1fr;
     }
 
     #param_input {
         dock: bottom;
+    }
+
+    #top_right {
+        height: 1fr;
+        width: 30%;
+        border: round $primary;
+        padding: 0 1;
     }
 
     #bottom {
@@ -122,13 +139,19 @@ class ComfyHelperApp(App[None]):
         self.batch_values: dict[tuple[str, str], Any] = {}
         self.confirm_message: str | None = None
         self.confirm_callback: Callable[[], Awaitable[None]] | None = None
+        self.confirm_cancel_callback: Callable[[], Awaitable[None]] | None = None
         self.quit_confirm_pending = False
+        self.shuffle_prompt_message: str | None = None
+        self.shuffle_prompt_yes_callback: Callable[[], Awaitable[None]] | None = None
+        self.shuffle_prompt_no_callback: Callable[[], Awaitable[None]] | None = None
+        self.shuffle_prompt_continue_callback: Callable[[], Awaitable[None]] | None = None
         self.session_tasks: dict[str, str] = {}
         self.session_total_nodes: dict[str, int] = {}
         self.session_executed_nodes: dict[str, set[str]] = {}
         self.session_cached_nodes: dict[str, set[str]] = {}
         self.session_finished: set[str] = set()
         self.workflow_last_values: dict[str, dict[tuple[str, str], Any]] = {}
+        self.workflow_last_submissions: dict[str, LastSubmission] = {}
         self.workflow_history_raw: dict[str, dict[str, Any]] = {}
         self.workflow_history_dir = Path.cwd() / "data" / "workflow_history"
         self.last_submission: LastSubmission | None = None
@@ -139,9 +162,11 @@ class ComfyHelperApp(App[None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="root"):
-            with Vertical(id="top"):
-                yield Static(id="top_content")
-                yield Input(id="param_input")
+            with Horizontal(id="top"):
+                with Vertical(id="top_left"):
+                    yield Static(id="top_left_content")
+                    yield Input(id="param_input")
+                yield Static(id="top_right")
             yield Static(id="bottom")
 
     async def on_mount(self) -> None:
@@ -153,6 +178,7 @@ class ComfyHelperApp(App[None]):
         for message in self.config.messages:
             self.add_message(message)
         self.reload_workflows()
+        await self.refresh_workflow_history_cache()
         self.render_all()
         self._tasks.append(asyncio.create_task(self.poll_loop()))
         self._tasks.append(asyncio.create_task(self.websocket_loop()))
@@ -166,6 +192,9 @@ class ComfyHelperApp(App[None]):
         logging.info("Comfy Helper stopped")
 
     async def on_key(self, event: events.Key) -> None:
+        if self.shuffle_prompt_message:
+            await self.handle_shuffle_prompt_key(event)
+            return
         if self.confirm_message:
             await self.handle_confirm_key(event)
             return
@@ -175,9 +204,18 @@ class ComfyHelperApp(App[None]):
                 self.fill_current_field_into_input()
                 event.stop()
                 return
+            if event.key == "f7" and self.is_param_input_focused():
+                self.clear_current_field_input()
+                event.stop()
+                return
+            if event.key == "f3" and self.is_param_input_focused():
+                await self.go_to_previous_field()
+                event.stop()
+                return
             if event.key == "escape":
                 self.cancel_input()
                 event.stop()
+                return
             elif event.key == "tab":
                 self.complete_path()
                 event.stop()
@@ -199,6 +237,7 @@ class ComfyHelperApp(App[None]):
             return
         if key == "r":
             self.reload_workflows()
+            await self.refresh_workflow_history_cache()
             self.render_all()
             event.stop()
             return
@@ -248,8 +287,9 @@ class ComfyHelperApp(App[None]):
     async def action_request_quit(self) -> None:
         await self.request_quit()
 
-    def action_reload_workflows(self) -> None:
+    async def action_reload_workflows(self) -> None:
         self.reload_workflows()
+        await self.refresh_workflow_history_cache()
         self.render_all()
 
     async def action_refresh_status(self) -> None:
@@ -323,6 +363,28 @@ class ComfyHelperApp(App[None]):
             self.add_message(message)
         self.add_message(f"Loaded {len(workflows)} workflow(s).")
         logging.info("Scanned %s workflow(s) from %s", len(workflows), self.config.workflow_dir)
+
+    async def refresh_workflow_history_cache(self) -> None:
+        if not self.workflows:
+            self.workflow_last_submissions = {}
+            return
+
+        refreshed: dict[str, LastSubmission] = {}
+        for workflow in self.workflows:
+            workflow_key = self.workflow_history_key(workflow)
+            raw_history = self.workflow_history_raw.get(workflow_key)
+            if raw_history is None:
+                continue
+            values = raw_history.get("values", {})
+            if not isinstance(values, dict) or not values:
+                continue
+            refreshed[workflow_key] = LastSubmission(
+                workflow_name=workflow.name,
+                values=copy.deepcopy(values),
+                count=1,
+            )
+
+        self.workflow_last_submissions = refreshed
 
     def find_workflow_by_name(self, name: str) -> WorkflowInfo | None:
         return next((workflow for workflow in self.workflows if workflow.name == name), None)
@@ -404,7 +466,8 @@ class ComfyHelperApp(App[None]):
                 source = raw_value.get("dir")
                 if not isinstance(source, str) or not source.strip():
                     return None
-                return await self.prepare_load_image_value(source)
+                shuffle = bool(raw_value.get("shuffle", False))
+                return await self.prepare_load_image_value(source, shuffle=shuffle)
             if value_type in {"load_image_file", "load_image_dir"}:
                 source = raw_value.get("path")
                 if not isinstance(source, str) or not source.strip():
@@ -427,7 +490,7 @@ class ComfyHelperApp(App[None]):
             if isinstance(value, RandomSeedValue):
                 serialized[key_text] = {"type": "random_seed"}
             elif isinstance(value, ImageBatch):
-                serialized[key_text] = {"type": "image_batch", "dir": value.source}
+                serialized[key_text] = {"type": "image_batch", "dir": value.source, "shuffle": value.shuffle}
             else:
                 serialized[key_text] = copy.deepcopy(value)
         return serialized
@@ -516,13 +579,11 @@ class ComfyHelperApp(App[None]):
         while self.active_field_index < len(workflow.fields):
             field = workflow.fields[self.active_field_index]
             if field.supported:
-                param_input = self.query_one("#param_input", Input)
-                param_input.value = ""
-                param_input.cursor_position = 0
-                param_input.placeholder = "Enter keeps current, :run submits now, F2 fills current, Esc cancels"
-                param_input.remove_class("hidden")
-                param_input.can_focus = True
-                param_input.focus()
+                self.show_param_input(
+                    field,
+                    preset_value="",
+                    placeholder="Enter keeps current, :run submits now, F2 fills current, F7 clears input, F3 previous, Esc cancels",
+                )
                 self.render_all()
                 return
             self.add_message(f"Unsupported field skipped: {field.display_name}")
@@ -542,10 +603,13 @@ class ComfyHelperApp(App[None]):
             return
         if not await self.capture_current_field_value(value_text):
             return
-        self.active_field_index += 1
-        self.show_input_for_current_field()
+        await self.advance_after_current_field()
 
-    async def capture_current_field_value(self, value_text: str) -> bool:
+    async def capture_current_field_value(
+            self,
+            value_text: str,
+            shuffle_continue_callback: Callable[[], Awaitable[None]] | None = None,
+    ) -> bool:
         workflow = self.active_workflow
         if workflow is None:
             return False
@@ -560,6 +624,14 @@ class ComfyHelperApp(App[None]):
                 self.render_all()
                 return False
             self.active_values[field_key] = value
+            if field.is_load_image and isinstance(value, ImageBatch) and len(value.images) > 1 and not value.shuffle:
+                await self.prompt_image_batch_shuffle(
+                    field.display_name,
+                    field_key,
+                    value,
+                    shuffle_continue_callback or self.advance_after_current_field,
+                )
+                return False
         self.input_error = None
         self.clear_completion()
         return True
@@ -572,13 +644,13 @@ class ComfyHelperApp(App[None]):
         value_text = param_input.value.strip()
         if value_text == ":run":
             value_text = ""
-        if not await self.capture_current_field_value(value_text):
+        if not await self.capture_current_field_value(value_text, self.start_batch_count_from_current_values):
             return
         values = dict(self.active_values)
         self.cancel_input(render=False)
         self.show_batch_count_input(workflow, values)
 
-    async def prepare_load_image_value(self, value_text: str) -> str:
+    async def prepare_load_image_value(self, value_text: str, shuffle: bool = False) -> str | ImageBatch:
         image_path = self.normalize_input_path(value_text)
         if not image_path.exists():
             raise ValueError(f"File does not exist: {image_path}")
@@ -604,7 +676,7 @@ class ComfyHelperApp(App[None]):
             images = [await self.client.upload_image(path) for path in image_files]
         else:
             images = [await asyncio.to_thread(self.copy_image_into_comfyui_input, path) for path in image_files]
-        return ImageBatch(source=str(image_path), images=images)
+        return ImageBatch(source=str(image_path), images=images, shuffle=shuffle)
 
     def normalize_input_path(self, value_text: str) -> Path:
         path = Path(value_text).expanduser()
@@ -650,6 +722,110 @@ class ComfyHelperApp(App[None]):
                 self.show_batch_count_input(workflow, values)
             else:
                 await self.submit_workflow(workflow, values)
+
+    async def advance_after_current_field(self) -> None:
+        self.active_field_index += 1
+        self.show_input_for_current_field()
+
+    def show_param_input(
+            self,
+            field: ConfigField,
+            preset_value: str,
+            placeholder: str,
+    ) -> None:
+        param_input = self.query_one("#param_input", Input)
+        param_input.value = preset_value
+        param_input.cursor_position = len(param_input.value)
+        param_input.placeholder = placeholder
+        param_input.remove_class("hidden")
+        param_input.can_focus = True
+        param_input.focus()
+
+    async def go_to_previous_field(self) -> None:
+        workflow = self.active_workflow
+        if workflow is None:
+            self.cancel_input()
+            return
+        index = self.active_field_index - 1
+        while index >= 0:
+            field = workflow.fields[index]
+            if field.supported:
+                self.active_field_index = index
+                current = self.active_values.get((field.node_id, field.name), field.value)
+                self.input_error = None
+                self.clear_completion()
+                self.show_param_input(
+                    field,
+                    preset_value=self.field_value_to_input_text(current),
+                    placeholder="Enter keeps current, :run submits now, F2 fills current, F7 clears input, F3 previous, Esc cancels",
+                )
+                self.render_all()
+                return
+            index -= 1
+        self.cancel_input()
+
+    async def start_batch_count_from_current_values(self) -> None:
+        workflow = self.active_workflow
+        if workflow is None:
+            return
+        values = dict(self.active_values)
+        self.cancel_input(render=False)
+        self.show_batch_count_input(workflow, values)
+
+    async def prompt_image_batch_shuffle(
+            self,
+            field_display_name: str,
+            field_key: tuple[str, str],
+            batch: ImageBatch,
+            continue_callback: Callable[[], Awaitable[None]],
+    ) -> None:
+        self.hide_param_input(render=False)
+        self.input_error = None
+        self.clear_completion()
+        self.shuffle_prompt_message = f"Shuffle file order for {field_display_name}?"
+        self.shuffle_prompt_yes_callback = lambda: self.apply_image_batch_shuffle(field_key, batch, True)
+        self.shuffle_prompt_no_callback = lambda: self.apply_image_batch_shuffle(field_key, batch, False)
+        self.shuffle_prompt_continue_callback = continue_callback
+        self.render_all()
+
+    async def apply_image_batch_shuffle(
+            self,
+            field_key: tuple[str, str],
+            batch: ImageBatch,
+            shuffle: bool,
+    ) -> None:
+        continue_callback = self.shuffle_prompt_continue_callback or self.advance_after_current_field
+        self.shuffle_prompt_message = None
+        self.shuffle_prompt_yes_callback = None
+        self.shuffle_prompt_no_callback = None
+        self.shuffle_prompt_continue_callback = None
+        self.active_values[field_key] = ImageBatch(source=batch.source, images=list(batch.images), shuffle=shuffle)
+        await continue_callback()
+
+    def clear_shuffle_prompt(self) -> None:
+        self.shuffle_prompt_message = None
+        self.shuffle_prompt_yes_callback = None
+        self.shuffle_prompt_no_callback = None
+        self.shuffle_prompt_continue_callback = None
+
+    async def handle_shuffle_prompt_key(self, event: events.Key) -> None:
+        if event.key in {"escape", "n", "enter"}:
+            callback = self.shuffle_prompt_no_callback
+            self.clear_shuffle_prompt()
+            if callback:
+                await callback()
+            self.render_all()
+            event.stop()
+            return
+        if event.key in {"y"}:
+            callback = self.shuffle_prompt_yes_callback
+            self.clear_shuffle_prompt()
+            if callback:
+                await callback()
+            self.render_all()
+            event.stop()
+            return
+        event.stop()
 
     def show_batch_count_input(
             self,
@@ -699,6 +875,7 @@ class ComfyHelperApp(App[None]):
         self.active_values = {}
         self.batch_after_input = False
         self.input_error = None
+        self.clear_shuffle_prompt()
         self.clear_completion()
         self.hide_param_input()
         if render:
@@ -710,18 +887,21 @@ class ComfyHelperApp(App[None]):
         self.batch_workflow = None
         self.batch_values = {}
         self.input_error = None
+        self.clear_shuffle_prompt()
         self.clear_completion()
         self.hide_param_input()
         if render:
             self.add_message("Cancelled batch submit.")
             self.render_all()
 
-    def hide_param_input(self) -> None:
+    def hide_param_input(self, render: bool = True) -> None:
         param_input = self.query_one("#param_input", Input)
         param_input.value = ""
         param_input.add_class("hidden")
         param_input.can_focus = False
         self.set_focus(None)
+        if render:
+            self.render_all()
 
     async def submit_workflow(
             self,
@@ -735,10 +915,17 @@ class ComfyHelperApp(App[None]):
             return
         if not self.runtime.pending:
             self.runtime.recent_success_count = 0
+        serialized_values = self.serialize_history_values(values)
+        snapshot = LastSubmission(workflow_name=workflow.name, values=copy.deepcopy(values), count=count)
+        self.last_submission = snapshot
         # save last values
         workflow_key = self.workflow_history_key(workflow)
         self.workflow_last_values[workflow_key] = copy.deepcopy(values)
-        serialized_values = self.serialize_history_values(values)
+        self.workflow_last_submissions[workflow_key] = LastSubmission(
+            workflow_name=workflow.name,
+            values=copy.deepcopy(serialized_values),
+            count=count,
+        )
         self.save_workflow_history(workflow, serialized_values)
 
         # do submit
@@ -747,22 +934,29 @@ class ComfyHelperApp(App[None]):
             resolved_values_list = self.resolve_submission_values(values)
             for batch_index, resolved_values in enumerate(resolved_values_list):
                 prompt_id = str(uuid.uuid4())
+                self.session_tasks[prompt_id] = workflow.name
+                self.session_total_nodes[prompt_id] = len(workflow.data)
+                self.session_executed_nodes[prompt_id] = set()
+                self.session_finished.discard(prompt_id)
                 try:
                     prompt = apply_field_values(workflow.data, resolved_values)
                     await self.client.submit(prompt, self.client_id, prompt_id)
                 except Exception as exc:
                     logging.exception("Failed to submit workflow %s", workflow.name)
                     self.add_message(f"Submit failed for {workflow.name}: {short_error(exc)}")
+                    self.session_tasks.pop(prompt_id, None)
+                    self.session_total_nodes.pop(prompt_id, None)
+                    self.session_executed_nodes.pop(prompt_id, None)
+                    self.session_cached_nodes.pop(prompt_id, None)
+                    self.runtime.progress.pop(prompt_id, None)
+                    self.runtime.current_node.pop(prompt_id, None)
+                    self.session_finished.discard(prompt_id)
                     if submitted:
                         self.add_message(
                             f"Submitted {len(submitted)}/{count * len(resolved_values_list)} before failure.")
                     await self.refresh_status()
                     self.render_all()
                     return
-                self.session_tasks[prompt_id] = workflow.name
-                self.session_total_nodes[prompt_id] = len(workflow.data)
-                self.session_executed_nodes[prompt_id] = set()
-                self.session_finished.discard(prompt_id)
                 submitted.append(prompt_id)
                 logging.info(
                     "Submitted workflow %s prompt_id=%s batch_index=%s/%s image_batch_index=%s/%s",
@@ -779,7 +973,6 @@ class ComfyHelperApp(App[None]):
             self.add_message(
                 f"Submitted {workflow.name} {len(submitted)} times, first prompt_id {submitted[0]}, last {submitted[-1]}"
             )
-        self.last_submission = LastSubmission(workflow_name=workflow.name, values=copy.deepcopy(values), count=count)
         await self.refresh_status()
         self.render_all()
 
@@ -795,30 +988,48 @@ class ComfyHelperApp(App[None]):
         if not raw:
             self.clear_completion()
             return
-        expanded = str(Path(raw).expanduser())
-        if Path(expanded).exists() and Path(expanded).is_dir():
-            expanded = expanded + "/"
-        matches = sorted(glob.glob(expanded + "*"))
-        if not matches:
+        common, matches = self.complete_path_value(raw)
+        if common is None:
             self.input_error = "No path completion matches."
             self.clear_completion()
             self.render_all()
             return
+        if len(matches) == 1:
+            self.clear_completion()
+        else:
+            self.completion_prefix = raw
+            self.completion_matches = matches
+        param_input.value = common
+        param_input.cursor_position = len(param_input.value)
+        self.input_error = None
+        self.render_all()
+
+    def complete_path_value(self, raw: str) -> tuple[str | None, list[str]]:
+        raw_is_dir_prefix = raw.endswith("/")
+        expanded = str(Path(raw).expanduser())
+        if Path(expanded).exists() and Path(expanded).is_dir():
+            expanded = expanded + "/"
+            raw_is_dir_prefix = True
+        matches = self.sort_completion_matches(glob.glob(expanded + "*"))
+        if not matches:
+            return None, []
         common = _common_prefix(matches)
         if len(matches) == 1:
             common = _format_completion(matches[0])
-            self.clear_completion()
         else:
             if len(common) > len(expanded):
                 common = _format_completion(common)
             else:
                 common = _format_completion(expanded)
-            self.completion_prefix = raw
-            self.completion_matches = [_format_completion(match) for match in matches[:20]]
-        param_input.value = common
-        param_input.cursor_position = len(param_input.value)
-        self.input_error = None
-        self.render_all()
+        if raw_is_dir_prefix and common and not common.endswith("/"):
+            common += "/"
+        return common, [_format_completion(match) for match in matches[:20]]
+
+    def sort_completion_matches(self, matches: list[str]) -> list[str]:
+        return sorted(
+            matches,
+            key=lambda path: (not os.path.isdir(path), Path(path).name.lower(), Path(path).as_posix().lower()),
+        )
 
     def fill_current_field_into_input(self) -> None:
         workflow = self.active_workflow
@@ -830,6 +1041,14 @@ class ComfyHelperApp(App[None]):
         param_input = self.query_one("#param_input", Input)
         param_input.value = self.field_value_to_input_text(current)
         param_input.cursor_position = len(param_input.value)
+        self.input_error = None
+        self.clear_completion()
+        self.render_all()
+
+    def clear_current_field_input(self) -> None:
+        param_input = self.query_one("#param_input", Input)
+        param_input.value = ""
+        param_input.cursor_position = 0
         self.input_error = None
         self.clear_completion()
         self.render_all()
@@ -900,7 +1119,10 @@ class ComfyHelperApp(App[None]):
 
         field_key, image_batch = batch
         result: list[dict[tuple[str, str], Any]] = []
-        for image in image_batch.images:
+        images = list(image_batch.images)
+        if image_batch.shuffle and len(images) > 1:
+            random.shuffle(images)
+        for image in images:
             resolved = self.resolve_single_submission_values(values)
             resolved[field_key] = image
             result.append(resolved)
@@ -1136,12 +1358,29 @@ class ComfyHelperApp(App[None]):
     def render_all(self) -> None:
         if not self.is_mounted:
             return
-        self.query_one("#top_content", Static).update(self.render_top())
+        top_left = self.query_one("#top_left_content", Static)
+        top_right = self.query_one("#top_right", Static)
+        compact = self.is_compact_layout()
+        if compact:
+            top_left.styles.width = "100%"
+            top_right.add_class("hidden")
+        else:
+            top_left.styles.width = "70%"
+            top_right.styles.width = "30%"
+            top_right.remove_class("hidden")
+        top_left.update(self.render_top())
+        top_right.update(self.render_workflow_history_panel())
         self.query_one("#bottom", Static).update(self.render_bottom())
 
     def render_top(self) -> str:
         compact = self.is_compact_layout()
         border = "[bold cyan]" if self.focus_area == "top" else "[bold]"
+        if self.shuffle_prompt_message:
+            return (
+                f"{border}Operation[/]\n\n"
+                f"[yellow]{escape(self.shuffle_prompt_message)}[/]\n\n"
+                "y shuffle | Enter/n/Esc keep order"
+            )
         if self.confirm_message:
             confirm_hint = "q/Enter/y confirm | Esc/n cancel" if self.quit_confirm_pending else "Enter/y confirm | Esc/n cancel"
             return (
@@ -1154,6 +1393,42 @@ class ComfyHelperApp(App[None]):
         if self.mode == "batch_count":
             return self.render_batch_count(compact=compact)
         return self.render_browser(compact=compact)
+
+    def render_workflow_history_panel(self) -> str:
+        workflow = self.selected_workflow
+        if workflow is None:
+            return "[bold cyan]Submission History[/]\n\nNo workflow selected."
+
+        history = self.workflow_last_submissions.get(self.workflow_history_key(workflow))
+        lines = ["[bold cyan]Submission History[/]", "", f"Workflow: {escape(workflow.name)}"]
+        if history is None:
+            lines.append("")
+            lines.append("No submission history yet.")
+            return "\n".join(lines)
+
+        lines.append("")
+        lines.append("Last submission values:")
+        field_map = {(field.node_id, field.name): field for field in workflow.fields}
+        items = sorted(
+            history.values.items(),
+            key=lambda item: (
+                0 if item[0][0].isdigit() else 1,
+                int(item[0][0]) if item[0][0].isdigit() else item[0][0],
+                item[0][1],
+            ),
+        )
+        for index, (key_text, value) in enumerate(items):
+            field_key = self.deserialize_field_key(key_text)
+            if field_key is None:
+                continue
+            field = field_map.get(field_key)
+            field_label = field.display_name if field is not None else f"{field_key[0]}/{field_key[1]}"
+            lines.append(
+                f"{escape(field_key[0])}/{escape(field_key[1])} {escape(field_label)}: {escape(format_history_value(value))}"
+            )
+            if index < len(items) - 1:
+                lines.append("----------")
+        return "\n".join(lines)
 
     def render_browser(self, compact: bool = False) -> str:
         lines = ["[bold cyan]Workflow Runner[/]" if self.focus_area == "top" else "[bold]Workflow Runner[/]"]
@@ -1212,7 +1487,7 @@ class ComfyHelperApp(App[None]):
                 f"{escape(workflow.name)}",
                 f"Step {self.active_field_index + 1}/{len(workflow.fields)}: {escape(field.display_name)}",
                 f"Value: {escape(format_field_value(current))}",
-                "Enter keeps current | F2 fills current | :run submits | Esc cancels",
+                "Enter keeps current | F2 fills current | F7 clears input | F3 previous | :run submits | Esc cancels",
             ]
         else:
             lines = [
@@ -1222,7 +1497,7 @@ class ComfyHelperApp(App[None]):
                 f"Step {self.active_field_index + 1}/{len(workflow.fields)}: {escape(field.display_name)}",
                 f"Current value: {escape(format_field_value(current))}",
                 "",
-                "Input new value, Enter keeps current, F2 fills current value, :run submits now, Esc cancels:",
+                "Input new value, Enter keeps current, F2 fills current value, F7 clears input, F3 previous, :run submits now, Esc cancels:",
             ]
             if isinstance(field.value, int) and not isinstance(field.value, bool):
                 lines.append("Use :seed for a new random integer on every submission.")
@@ -1272,8 +1547,8 @@ class ComfyHelperApp(App[None]):
         lines = [
             f"{focus} ComfyUI {status} | running {color_count(len(self.runtime.running), 'yellow')} | "
             f"pending {color_count(len(self.runtime.pending), 'cyan')} | "
-            f"success {color_count(self.runtime.recent_success_count, 'blue')} | "
-            f"recent {color_count(len(self.runtime.recent), 'green')} | "
+            f"success {color_count(self.runtime.recent_success_count, 'green')} | "
+            f"recent {color_count(len(self.runtime.recent), 'blue')} | "
             f"error {color_count(error_count, 'red')}",
         ]
         if self.runtime.running:
@@ -1392,10 +1667,12 @@ class ComfyHelperApp(App[None]):
             self.session_finished.discard(prompt_id)
 
     def help_text(self) -> str:
+        if self.shuffle_prompt_message:
+            return "y shuffle | Enter/n/Esc keep order"
         if self.confirm_message:
             return "q/Enter/y confirm | Esc/n cancel" if self.quit_confirm_pending else "Enter/y confirm | Esc/n cancel"
         if self.mode == "input":
-            return "Enter next | F2 fill current | b/:batch batch | :seed random | :run submit | Tab complete | Esc cancel"
+            return "Enter next | F2 fill current | F7 clear input | F3 previous | b/:batch batch | :seed random | :run submit | Tab complete | Esc cancel"
         if self.mode == "batch_count":
             return "Enter submit batch | positive integer only | Esc cancel"
         return "↑↓ sel | Enter run | b batch | u repeat | Tab | r/s refresh | i/d/c queue | q quit"
@@ -1423,7 +1700,29 @@ def format_field_value(value: Any) -> str:
     if isinstance(value, RandomSeedValue):
         return ":seed (random each submit)"
     if isinstance(value, ImageBatch):
-        return f"{len(value.images)} images from {value.source}"
+        suffix = " (shuffled)" if value.shuffle else ""
+        return f"{len(value.images)} images from {value.source}{suffix}"
+    return str(value)
+
+
+def format_history_value(value: Any) -> str:
+    if isinstance(value, RandomSeedValue):
+        return ":seed (random each submit)"
+    if isinstance(value, ImageBatch):
+        suffix = " (shuffled)" if value.shuffle else ""
+        return f"image batch from {value.source}{suffix}"
+    if isinstance(value, dict):
+        value_type = value.get("type")
+        if value_type == "random_seed":
+            return ":seed (random each submit)"
+        if value_type == "image_batch":
+            source = value.get("dir", "")
+            shuffle = bool(value.get("shuffle", False))
+            suffix = " (shuffled)" if shuffle else ""
+            return f"image batch from {source}{suffix}"
+        if value_type in {"load_image_file", "load_image_dir"}:
+            source = value.get("path", "")
+            return str(source)
     return str(value)
 
 

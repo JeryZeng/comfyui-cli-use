@@ -5,10 +5,10 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
-from comfyui_helper.app import ComfyHelperApp, ImageBatch, RandomSeedValue
-from comfyui_helper.state import QueueItem
+from comfyui_helper.app import ComfyHelperApp, ImageBatch, LastSubmission, RandomSeedValue, format_field_value
+from comfyui_helper.state import QueueItem, RecentItem
 from comfyui_helper.workflow import ConfigField, WorkflowInfo
 
 
@@ -65,6 +65,7 @@ class ComfyHelperAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(batch_value, ImageBatch)
             self.assertEqual(batch_value.source, str(symlink_dir.absolute()))
             self.assertEqual(len(batch_value.images), 2)
+            self.assertFalse(batch_value.shuffle)
 
             values = {
                 ("1", "seed"): RandomSeedValue(),
@@ -73,7 +74,10 @@ class ComfyHelperAppTests(unittest.IsolatedAsyncioTestCase):
             }
             serialized = app.serialize_history_values(values)
             self.assertEqual(serialized["1|seed"], {"type": "random_seed"})
-            self.assertEqual(serialized["2|image"], {"type": "image_batch", "dir": str(symlink_dir.absolute())})
+            self.assertEqual(
+                serialized["2|image"],
+                {"type": "image_batch", "dir": str(symlink_dir.absolute()), "shuffle": False},
+            )
             self.assertEqual(serialized["3|prompt"], "hello")
 
             app.save_workflow_history(workflow, serialized)
@@ -92,6 +96,7 @@ class ComfyHelperAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsInstance(restored_batch, ImageBatch)
                 self.assertEqual(restored_batch.source, str(symlink_dir.absolute()))
                 self.assertEqual(len(restored_batch.images), 2)
+                self.assertFalse(restored_batch.shuffle)
             finally:
                 await reader.client.close()
         finally:
@@ -125,6 +130,380 @@ class ComfyHelperAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(restored[("2", "image")], image_path.name)
             finally:
                 await reader.client.close()
+        finally:
+            await app.client.close()
+
+    async def test_shuffle_image_batch_is_applied_per_submission(self) -> None:
+        app = self.make_app()
+        try:
+            values = {
+                ("2", "image"): ImageBatch(
+                    source="/tmp/images",
+                    images=["a.png", "b.png", "c.png"],
+                    shuffle=True,
+                )
+            }
+            with patch("comfyui_helper.app.random.shuffle", new=lambda items: items.reverse()):
+                resolved = app.resolve_submission_values(values)
+            self.assertEqual([item[("2", "image")] for item in resolved], ["c.png", "b.png", "a.png"])
+        finally:
+            await app.client.close()
+
+    def test_format_field_value_shows_image_batch_shuffle_state(self) -> None:
+        value = ImageBatch(source="/tmp/images", images=["a.png", "b.png"], shuffle=True)
+        self.assertEqual(format_field_value(value), "2 images from /tmp/images (shuffled)")
+
+    async def test_shuffle_prompt_hides_input_before_waiting_for_confirmation(self) -> None:
+        app = self.make_app()
+        try:
+            batch = ImageBatch(source="/tmp/images", images=["a.png", "b.png"], shuffle=False)
+            with patch.object(app, "hide_param_input") as hide_param_input, patch.object(app, "render_all") as render_all:
+                await app.prompt_image_batch_shuffle("LoadImage.image", ("2", "image"), batch, app.advance_after_current_field)
+            hide_param_input.assert_called_once_with(render=False)
+            render_all.assert_called_once()
+            self.assertEqual(app.shuffle_prompt_message, "Shuffle file order for LoadImage.image?")
+        finally:
+            await app.client.close()
+
+    async def test_f3_in_input_mode_returns_to_previous_supported_field(self) -> None:
+        app = self.make_app()
+        try:
+            workflow = self.make_workflow()
+            app.active_workflow = workflow
+            app.mode = "input"
+            app.active_field_index = 2
+            app.active_values = {
+                ("1", "seed"): 7,
+                ("2", "image"): ImageBatch(source="/tmp/images", images=["a.png"], shuffle=True),
+            }
+
+            class FakeInput:
+                def __init__(self) -> None:
+                    self.value = ""
+                    self.cursor_position = 0
+                    self.placeholder = ""
+                    self.can_focus = False
+
+                def remove_class(self, _name: str) -> None:
+                    pass
+
+                def focus(self) -> None:
+                    pass
+
+            fake_input = FakeInput()
+            with patch.object(app, "query_one", return_value=fake_input), patch.object(app, "render_all"):
+                await app.go_to_previous_field()
+
+            self.assertEqual(app.active_field_index, 1)
+            self.assertEqual(fake_input.value, "/tmp/images")
+            self.assertEqual(fake_input.cursor_position, len("/tmp/images"))
+            self.assertEqual(
+                fake_input.placeholder,
+                "Enter keeps current, :run submits now, F2 fills current, F7 clears input, F3 previous, Esc cancels",
+            )
+        finally:
+            await app.client.close()
+
+    async def test_escape_in_input_mode_cancels_workflow_input(self) -> None:
+        app = self.make_app()
+        try:
+            workflow = self.make_workflow()
+            app.active_workflow = workflow
+            app.mode = "input"
+            app.active_field_index = 2
+            app.active_values = {
+                ("1", "seed"): 7,
+                ("2", "image"): ImageBatch(source="/tmp/images", images=["a.png"], shuffle=True),
+            }
+
+            class FakeInput:
+                def __init__(self) -> None:
+                    self.value = "keep me"
+                    self.cursor_position = 7
+                    self.placeholder = ""
+                    self.can_focus = True
+
+                def add_class(self, _name: str) -> None:
+                    pass
+
+                def remove_class(self, _name: str) -> None:
+                    pass
+
+                def focus(self) -> None:
+                    pass
+
+            fake_input = FakeInput()
+            with patch.object(app, "query_one", return_value=fake_input), patch.object(app, "render_all"), patch.object(app, "set_focus"):
+                app.cancel_input(render=False)
+
+            self.assertEqual(app.mode, "browse")
+            self.assertIsNone(app.active_workflow)
+            self.assertEqual(app.active_field_index, 0)
+            self.assertEqual(app.active_values, {})
+            self.assertEqual(fake_input.value, "")
+            self.assertFalse(fake_input.can_focus)
+        finally:
+            await app.client.close()
+
+    async def test_clear_current_field_input_empties_editor_content(self) -> None:
+        app = self.make_app()
+        try:
+            class FakeInput:
+                def __init__(self) -> None:
+                    self.value = "hello"
+                    self.cursor_position = 5
+
+            fake_input = FakeInput()
+            with patch.object(app, "query_one", return_value=fake_input), patch.object(app, "render_all"):
+                app.clear_current_field_input()
+
+            self.assertEqual(fake_input.value, "")
+            self.assertEqual(fake_input.cursor_position, 0)
+        finally:
+            await app.client.close()
+
+    async def test_accept_field_value_persists_latest_input(self) -> None:
+        app = self.make_app()
+        try:
+            workflow = self.make_workflow()
+            app.active_workflow = workflow
+            app.mode = "input"
+            app.active_field_index = 2
+            app.active_values = {("1", "seed"): 7}
+
+            with patch.object(app, "render_all"), patch.object(app, "show_input_for_current_field"):
+                await app.accept_field_value("updated prompt")
+
+            self.assertEqual(app.active_values[("3", "prompt")], "updated prompt")
+            self.assertEqual(app.active_field_index, 3)
+        finally:
+            await app.client.close()
+
+    async def test_render_workflow_history_panel_orders_fields_by_node_id(self) -> None:
+        app = self.make_app()
+        try:
+            workflow = self.make_workflow()
+            snapshot = LastSubmission(
+                workflow_name=workflow.name,
+                values={
+                    "3|prompt": "third",
+                    "1|seed": {"type": "random_seed"},
+                    "2|image": {"type": "image_batch", "dir": "/tmp/images", "shuffle": True},
+                },
+                count=1,
+            )
+            app.workflow_last_submissions[app.workflow_history_key(workflow)] = snapshot
+            app.workflows = [workflow]
+            app.workflow_index = 0
+            panel = app.render_workflow_history_panel()
+            lines = panel.splitlines()
+            seed_index = next(i for i, line in enumerate(lines) if line.startswith("1/seed"))
+            image_index = next(i for i, line in enumerate(lines) if line.startswith("2/image"))
+            prompt_index = next(i for i, line in enumerate(lines) if line.startswith("3/prompt"))
+            self.assertLess(seed_index, image_index)
+            self.assertLess(image_index, prompt_index)
+            self.assertIn("image batch from /tmp/images (shuffled)", panel)
+            self.assertIn("----------", panel)
+        finally:
+            await app.client.close()
+
+    def test_render_workflow_history_panel_shows_empty_state_without_history(self) -> None:
+        app = self.make_app()
+        workflow = self.make_workflow()
+        app.workflows = [workflow]
+        panel = app.render_workflow_history_panel()
+        self.assertIn("No submission history yet.", panel)
+
+    async def test_refresh_workflow_history_cache_loads_disk_history_into_right_panel(self) -> None:
+        app = self.make_app()
+        try:
+            workflow = self.make_workflow()
+            serialized = app.serialize_history_values(
+                {
+                    ("1", "seed"): RandomSeedValue(),
+                    ("3", "prompt"): "from disk",
+                }
+            )
+            app.save_workflow_history(workflow, serialized)
+            app.load_workflow_history()
+            app.workflows = [workflow]
+            await app.refresh_workflow_history_cache()
+
+            panel = app.render_workflow_history_panel()
+            self.assertIn("Workflow: demo", panel)
+            self.assertIn("1/seed", panel)
+            self.assertIn("3/prompt", panel)
+            self.assertIn("from disk", panel)
+            self.assertNotIn("images from", panel)
+        finally:
+            await app.client.close()
+
+    async def test_submit_workflow_records_last_submission_before_request_failure(self) -> None:
+        app = self.make_app()
+        try:
+            workflow = replace(self.make_workflow(), data={"1": {"inputs": {}}})
+            values = {
+                ("1", "seed"): 7,
+                ("2", "image"): ImageBatch(source="/tmp/images", images=["a.png"], shuffle=True),
+                ("3", "prompt"): "hello",
+            }
+
+            async def fake_submit(*_args, **_kwargs) -> None:
+                self.assertIsNotNone(app.last_submission)
+                self.assertEqual(app.last_submission.workflow_name, workflow.name)
+                self.assertEqual(app.last_submission.values[("3", "prompt")], "hello")
+                self.assertIn(app.workflow_history_key(workflow), app.workflow_last_submissions)
+                self.assertEqual(app.workflow_last_submissions[app.workflow_history_key(workflow)].values["1|seed"], 7)
+                raise RuntimeError("boom")
+
+            with patch("comfyui_helper.app.apply_field_values", return_value={}), patch.object(
+                app.client, "submit", side_effect=fake_submit
+            ), patch.object(app, "render_all"), patch.object(app, "refresh_status"):
+                await app.submit_workflow(workflow, values)
+
+            self.assertIsNotNone(app.last_submission)
+            self.assertEqual(app.last_submission.workflow_name, workflow.name)
+            self.assertEqual(app.last_submission.values[("3", "prompt")], "hello")
+            self.assertEqual(app.workflow_last_submissions[app.workflow_history_key(workflow)].values["2|image"]["shuffle"], True)
+        finally:
+            await app.client.close()
+
+    async def test_submit_workflow_counts_completion_that_arrives_during_request(self) -> None:
+        app = self.make_app()
+        try:
+            workflow = replace(
+                self.make_workflow(),
+                data={
+                    "1": {"inputs": {"seed": 1}},
+                    "2": {"inputs": {"image": ""}},
+                    "3": {"inputs": {"prompt": ""}},
+                },
+            )
+            values = {
+                ("1", "seed"): 7,
+                ("2", "image"): "image.png",
+                ("3", "prompt"): "hello",
+            }
+
+            async def fake_submit(prompt, client_id, prompt_id) -> None:
+                self.assertEqual(app.session_tasks[prompt_id], workflow.name)
+                await app.handle_ws_message(
+                    {
+                        "type": "executing",
+                        "data": {
+                            "prompt_id": prompt_id,
+                            "node": None,
+                        },
+                    }
+                )
+
+            with patch("comfyui_helper.app.apply_field_values", return_value={}), patch.object(
+                app.client, "submit", side_effect=fake_submit
+            ), patch.object(app, "refresh_status", new=AsyncMock(return_value=None)), patch.object(
+                app, "render_all"
+            ):
+                await app.submit_workflow(workflow, values)
+
+            self.assertEqual(app.runtime.recent_success_count, 1)
+            self.assertEqual(len(app.runtime.recent), 1)
+        finally:
+            await app.client.close()
+
+    async def test_repeat_last_submission_uses_internal_tuple_values(self) -> None:
+        app = self.make_app()
+        try:
+            workflow = replace(self.make_workflow(), data={"1": {"inputs": {}}})
+            app.workflows = [workflow]
+            app.runtime.online = True
+            app.last_submission = LastSubmission(
+                workflow_name=workflow.name,
+                values={
+                    ("1", "seed"): 7,
+                    ("3", "prompt"): "repeat me",
+                },
+                count=1,
+            )
+
+            captured: dict[str, object] = {}
+
+            async def fake_submit(submitted_workflow, values, count=1):
+                captured["workflow"] = submitted_workflow
+                captured["values"] = values
+                captured["count"] = count
+
+            with patch.object(app, "submit_workflow", side_effect=fake_submit), patch.object(app, "render_all"):
+                await app.action_repeat_last_submission()
+
+            self.assertIs(captured["workflow"], workflow)
+            self.assertEqual(captured["values"][("3", "prompt")], "repeat me")
+            self.assertEqual(captured["count"], 1)
+        finally:
+            await app.client.close()
+
+    async def test_capture_current_field_value_stores_text_value(self) -> None:
+        app = self.make_app()
+        try:
+            workflow = self.make_workflow()
+            app.active_workflow = workflow
+            app.active_field_index = 2
+            app.active_values = {("1", "seed"): 7}
+
+            ok = await app.capture_current_field_value("updated prompt")
+
+            self.assertTrue(ok)
+            self.assertEqual(app.active_values[("3", "prompt")], "updated prompt")
+            self.assertEqual(app.input_error, None)
+        finally:
+            await app.client.close()
+
+    def test_mark_recent_increments_success_count_for_completed_prompts(self) -> None:
+        app = self.make_app()
+        app.session_tasks["p1"] = "demo"
+        app.session_tasks["p2"] = "demo"
+        app.mark_recent("p1", "completed")
+        app.mark_recent("p2", "completed")
+        self.assertEqual(app.runtime.recent_success_count, 2)
+        self.assertEqual(len(app.runtime.recent), 2)
+
+    async def test_capture_current_field_value_stores_seed_marker(self) -> None:
+        app = self.make_app()
+        try:
+            workflow = self.make_workflow()
+            app.active_workflow = workflow
+            app.active_field_index = 0
+
+            ok = await app.capture_current_field_value(":seed")
+
+            self.assertTrue(ok)
+            self.assertIsInstance(app.active_values[("1", "seed")], RandomSeedValue)
+        finally:
+            await app.client.close()
+
+    async def test_capture_current_field_value_keeps_loadimage_value_before_shuffle_prompt(self) -> None:
+        comfyui_dir = self.root / "ComfyUI"
+        (comfyui_dir / "input").mkdir(parents=True)
+        image_dir = self.root / "images"
+        image_dir.mkdir()
+        (image_dir / "a.png").write_bytes(b"1")
+        (image_dir / "b.png").write_bytes(b"2")
+
+        app = self.make_app(comfyui_dir=comfyui_dir)
+        try:
+            workflow = self.make_workflow()
+            app.active_workflow = workflow
+            app.active_field_index = 1
+
+            prompt = AsyncMock()
+            with patch("comfyui_helper.app.asyncio.to_thread", new=self.immediate_to_thread), patch.object(
+                app, "prompt_image_batch_shuffle", prompt
+            ):
+                ok = await app.capture_current_field_value(str(image_dir))
+
+            self.assertFalse(ok)
+            stored = app.active_values[("2", "image")]
+            self.assertIsInstance(stored, ImageBatch)
+            self.assertFalse(stored.shuffle)
+            prompt.assert_awaited_once()
         finally:
             await app.client.close()
 
@@ -163,6 +542,34 @@ class ComfyHelperAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("active", app.runtime.progress)
             self.assertIn("active", app.runtime.current_node)
             self.assertIn("active", app.session_finished)
+        finally:
+            await app.client.close()
+
+    async def test_complete_path_keeps_trailing_slash_for_directory_prefix(self) -> None:
+        app = self.make_app()
+        image_dir = self.root / "images"
+        image_dir.mkdir()
+        (image_dir / "one.png").write_bytes(b"1")
+        (image_dir / "two.jpg").write_bytes(b"2")
+        try:
+            common, matches = app.complete_path_value(str(image_dir) + "/")
+            self.assertIsNotNone(common)
+            self.assertTrue(common.endswith("/"))
+            self.assertEqual(len(matches), 2)
+        finally:
+            await app.client.close()
+
+    async def test_complete_path_orders_directories_before_files(self) -> None:
+        app = self.make_app()
+        base = self.root / "paths"
+        base.mkdir()
+        (base / "dir_a").mkdir()
+        (base / "file_a.txt").write_text("x", encoding="utf-8")
+        try:
+            _, matches = app.complete_path_value(str(base) + "/")
+            self.assertGreaterEqual(len(matches), 2)
+            self.assertTrue(matches[0].endswith("/"))
+            self.assertFalse(matches[1].endswith("/"))
         finally:
             await app.client.close()
 

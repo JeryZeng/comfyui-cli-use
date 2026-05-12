@@ -61,6 +61,10 @@ Rules:
 - No strict range is enforced for `refresh_interval`.
 - `comfyui_dir` is optional. If set, `LoadImage.image` files are copied into `comfyui_dir/input` before submission.
 - While editing a field, `F2` fills the current field value back into the input box.
+- While editing a field, `F7` clears the current input box content.
+- While editing a field, `F3` returns to the previous editable field.
+- While editing a field, `Esc` cancels the current workflow run.
+- If `LoadImage.image` points at a directory with multiple image files, the app asks whether to shuffle file order for that run; the choice is preserved in history and reused by `u`.
 
 Workflow history:
 
@@ -68,7 +72,7 @@ Workflow history:
 - History files are formatted JSON.
 - Normal values are stored directly.
 - `:seed` is stored as a random-seed marker.
-- `LoadImage` directory batches are stored as `image_batch` records with the original directory path.
+- `LoadImage` directory batches are stored as `image_batch` records with the original directory path and shuffle flag.
 - `data/` is ignored by git.
 
 ## Logging
@@ -297,9 +301,15 @@ Display each field as:
 ```text
 [1/4] [6] Positive Prompt / CLIPTextEncode.text
 Current value: a cat
-Input new value, Enter keeps current, :run submits now, Esc cancels:
+Input new value, Enter keeps current, F2 fills current value, F7 clears input, F3 previous, :run submits now, Esc cancels:
 >
 ```
+
+Top layout on wide screens:
+
+- Left panel: workflow browser or guided input.
+- Right panel: read-only last submission history for the selected workflow.
+- On small screens, the right panel is hidden and the left panel uses the full width.
 
 Node label:
 
