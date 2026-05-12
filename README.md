@@ -54,5 +54,6 @@ http://127.0.0.1:8188
 - `u`: repeat the last successful submission.
 - `Shift+Enter`: also attempts batch mode when the terminal reports it as a distinct key.
 - In integer fields, `:seed` requests a fresh random value on every submission.
+- In field editing mode, `F2` fills the current field value back into the input box.
 - `Tab`: switch focus between workflow selection and status/queue area.
 - `q`: quit the TUI.

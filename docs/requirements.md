@@ -60,6 +60,7 @@ Rules:
 - `refresh_interval` is in seconds and may be a float.
 - No strict range is enforced for `refresh_interval`.
 - `comfyui_dir` is optional. If set, `LoadImage.image` files are copied into `comfyui_dir/input` before submission.
+- While editing a field, `F2` fills the current field value back into the input box.
 
 Workflow history:
 

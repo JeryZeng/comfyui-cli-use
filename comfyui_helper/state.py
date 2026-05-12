@@ -29,6 +29,7 @@ class RuntimeState:
     pending: list[QueueItem] = field(default_factory=list)
     messages: Deque[str] = field(default_factory=lambda: deque(maxlen=5))
     recent: Deque[RecentItem] = field(default_factory=lambda: deque(maxlen=20))
+    recent_success_count: int = 0
     progress: dict[str, str] = field(default_factory=dict)
     current_node: dict[str, str] = field(default_factory=dict)
 

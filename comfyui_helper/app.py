@@ -166,16 +166,15 @@ class ComfyHelperApp(App[None]):
         logging.info("Comfy Helper stopped")
 
     async def on_key(self, event: events.Key) -> None:
-        if self.size.width < MIN_WIDTH or self.size.height < MIN_HEIGHT:
-            if event.key == "q":
-                self.exit()
-            return
-
         if self.confirm_message:
             await self.handle_confirm_key(event)
             return
 
         if self.mode == "input":
+            if event.key == "f2" and self.is_param_input_focused():
+                self.fill_current_field_into_input()
+                event.stop()
+                return
             if event.key == "escape":
                 self.cancel_input()
                 event.stop()
@@ -520,7 +519,7 @@ class ComfyHelperApp(App[None]):
                 param_input = self.query_one("#param_input", Input)
                 param_input.value = ""
                 param_input.cursor_position = 0
-                param_input.placeholder = "Enter keeps current, :run submits now, Esc cancels"
+                param_input.placeholder = "Enter keeps current, :run submits now, F2 fills current, Esc cancels"
                 param_input.remove_class("hidden")
                 param_input.can_focus = True
                 param_input.focus()
@@ -734,6 +733,8 @@ class ComfyHelperApp(App[None]):
             self.add_message("Workflow data is not available.")
             self.render_all()
             return
+        if not self.runtime.pending:
+            self.runtime.recent_success_count = 0
         # save last values
         workflow_key = self.workflow_history_key(workflow)
         self.workflow_last_values[workflow_key] = copy.deepcopy(values)
@@ -818,6 +819,31 @@ class ComfyHelperApp(App[None]):
         param_input.cursor_position = len(param_input.value)
         self.input_error = None
         self.render_all()
+
+    def fill_current_field_into_input(self) -> None:
+        workflow = self.active_workflow
+        if workflow is None:
+            return
+        field = workflow.fields[self.active_field_index]
+        field_key = (field.node_id, field.name)
+        current = self.active_values.get(field_key, field.value)
+        param_input = self.query_one("#param_input", Input)
+        param_input.value = self.field_value_to_input_text(current)
+        param_input.cursor_position = len(param_input.value)
+        self.input_error = None
+        self.clear_completion()
+        self.render_all()
+
+    def is_param_input_focused(self) -> bool:
+        param_input = self.query_one("#param_input", Input)
+        return bool(getattr(param_input, "has_focus", False))
+
+    def field_value_to_input_text(self, value: Any) -> str:
+        if isinstance(value, RandomSeedValue):
+            return ":seed"
+        if isinstance(value, ImageBatch):
+            return value.source
+        return str(value)
 
     def copy_image_into_comfyui_input(self, image_path: Path) -> str:
         comfyui_dir = self.config.comfyui_dir
@@ -931,6 +957,8 @@ class ComfyHelperApp(App[None]):
         self.runtime.running = parse_queue_items(queue.get("queue_running", []), self.session_tasks)
         self.runtime.pending = parse_queue_items(queue.get("queue_pending", []), self.session_tasks)
         self.sync_queue_totals(self.runtime.running + self.runtime.pending)
+        active_prompt_ids = {item.prompt_id for item in self.runtime.running + self.runtime.pending}
+        self.cleanup_finished_prompts(active_prompt_ids)
         if self.pending_index >= len(self.runtime.pending):
             self.pending_index = max(0, len(self.runtime.pending) - 1)
 
@@ -984,7 +1012,7 @@ class ComfyHelperApp(App[None]):
             self.mark_recent(prompt_id, "failed")
             message_text = data.get("exception_message") or data.get("exception_type") or "Execution failed."
             self.add_message(str(message_text))
-            self.session_finished.discard(prompt_id)
+            self.session_finished.add(prompt_id)
         elif event_type == "status":
             await self.refresh_status()
         self.render_all()
@@ -996,6 +1024,8 @@ class ComfyHelperApp(App[None]):
         existing = [item for item in self.runtime.recent if item.prompt_id == prompt_id and item.status == status]
         if existing:
             return
+        if status == "completed":
+            self.runtime.recent_success_count += 1
         self.runtime.recent.appendleft(
             RecentItem(
                 time_text=datetime.now().strftime("%H:%M:%S"),
@@ -1106,14 +1136,11 @@ class ComfyHelperApp(App[None]):
     def render_all(self) -> None:
         if not self.is_mounted:
             return
-        if self.size.width < MIN_WIDTH or self.size.height < MIN_HEIGHT:
-            self.query_one("#top_content", Static).update("Terminal too small, please resize.")
-            self.query_one("#bottom", Static).update("")
-            return
         self.query_one("#top_content", Static).update(self.render_top())
         self.query_one("#bottom", Static).update(self.render_bottom())
 
     def render_top(self) -> str:
+        compact = self.is_compact_layout()
         border = "[bold cyan]" if self.focus_area == "top" else "[bold]"
         if self.confirm_message:
             confirm_hint = "q/Enter/y confirm | Esc/n cancel" if self.quit_confirm_pending else "Enter/y confirm | Esc/n cancel"
@@ -1123,18 +1150,18 @@ class ComfyHelperApp(App[None]):
                 f"{confirm_hint}"
             )
         if self.mode == "input":
-            return self.render_input()
+            return self.render_input(compact=compact)
         if self.mode == "batch_count":
-            return self.render_batch_count()
-        return self.render_browser()
+            return self.render_batch_count(compact=compact)
+        return self.render_browser(compact=compact)
 
-    def render_browser(self) -> str:
+    def render_browser(self, compact: bool = False) -> str:
         lines = ["[bold cyan]Workflow Runner[/]" if self.focus_area == "top" else "[bold]Workflow Runner[/]"]
         lines.append("")
         if not self.workflows:
             lines.append(f"No workflows found in {escape(str(self.config.workflow_dir))}")
         else:
-            height_budget = max(4, self.size.height // 4)
+            height_budget = 3 if compact else max(4, self.size.height // 4)
             start = max(0, min(self.workflow_index - height_budget // 2, len(self.workflows) - height_budget))
             end = min(len(self.workflows), start + height_budget)
             for index, workflow in enumerate(self.workflows[start:end], start=start):
@@ -1148,45 +1175,63 @@ class ComfyHelperApp(App[None]):
         workflow = self.selected_workflow
         if workflow:
             status = "[green]valid[/]" if workflow.valid else "[red]invalid[/]"
-            modified = datetime.fromtimestamp(workflow.modified).strftime("%Y-%m-%d %H:%M:%S")
-            lines.extend(
-                [
-                    "[bold]Selected[/]",
-                    f"name: {escape(workflow.name)}",
-                    f"path: {escape(str(workflow.path))}",
-                    f"modified: {modified}",
-                    f"status: {status}",
-                    f"configurable fields: {len(workflow.fields)}",
-                    f"unsupported fields: {workflow.unsupported_count}",
-                ]
-            )
-            if workflow.error:
-                lines.append(f"error: [red]{escape(workflow.error)}[/]")
+            if compact:
+                lines.extend(
+                    [
+                        "[bold]Selected[/]",
+                        f"{escape(workflow.name)}",
+                        f"{status} | fields: {len(workflow.fields)} | unsupported: {workflow.unsupported_count}",
+                    ]
+                )
+            else:
+                modified = datetime.fromtimestamp(workflow.modified).strftime("%Y-%m-%d %H:%M:%S")
+                lines.extend(
+                    [
+                        "[bold]Selected[/]",
+                        f"name: {escape(workflow.name)}",
+                        f"path: {escape(str(workflow.path))}",
+                        f"modified: {modified}",
+                        f"status: {status}",
+                        f"configurable fields: {len(workflow.fields)}",
+                        f"unsupported fields: {workflow.unsupported_count}",
+                    ]
+                )
+                if workflow.error:
+                    lines.append(f"error: [red]{escape(workflow.error)}[/]")
         return "\n".join(lines)
 
-    def render_input(self) -> str:
+    def render_input(self, compact: bool = False) -> str:
         workflow = self.active_workflow
         if workflow is None:
             return ""
         field = workflow.fields[self.active_field_index]
         current = self.active_values.get((field.node_id, field.name), field.value)
-        lines = [
-            "[bold cyan]Guided Run[/]",
-            f"Workflow: {escape(workflow.name)}",
-            "",
-            f"Step {self.active_field_index + 1}/{len(workflow.fields)}: {escape(field.display_name)}",
-            f"Current value: {escape(format_field_value(current))}",
-            "",
-            "Input new value, Enter keeps current, :run submits now, Esc cancels:",
-        ]
-        if isinstance(field.value, int) and not isinstance(field.value, bool):
-            lines.append("Use :seed for a new random integer on every submission.")
-        if field.is_load_image:
-            if self.config.comfyui_dir is None:
-                lines.append("LoadImage.image accepts a local file or directory. Tab completes paths.")
-            else:
-                lines.append(
-                    "LoadImage.image file or directory will be copied into ComfyUI input. Tab completes paths.")
+        if compact:
+            lines = [
+                "[bold cyan]Guided Run[/]",
+                f"{escape(workflow.name)}",
+                f"Step {self.active_field_index + 1}/{len(workflow.fields)}: {escape(field.display_name)}",
+                f"Value: {escape(format_field_value(current))}",
+                "Enter keeps current | F2 fills current | :run submits | Esc cancels",
+            ]
+        else:
+            lines = [
+                "[bold cyan]Guided Run[/]",
+                f"Workflow: {escape(workflow.name)}",
+                "",
+                f"Step {self.active_field_index + 1}/{len(workflow.fields)}: {escape(field.display_name)}",
+                f"Current value: {escape(format_field_value(current))}",
+                "",
+                "Input new value, Enter keeps current, F2 fills current value, :run submits now, Esc cancels:",
+            ]
+            if isinstance(field.value, int) and not isinstance(field.value, bool):
+                lines.append("Use :seed for a new random integer on every submission.")
+            if field.is_load_image:
+                if self.config.comfyui_dir is None:
+                    lines.append("LoadImage.image accepts a local file or directory. Tab completes paths.")
+                else:
+                    lines.append(
+                        "LoadImage.image file or directory will be copied into ComfyUI input. Tab completes paths.")
         if self.input_error:
             lines.append(f"[red]{escape(self.input_error)}[/]")
         if self.completion_matches:
@@ -1195,30 +1240,39 @@ class ComfyHelperApp(App[None]):
             lines.extend(f"  {escape(match)}" for match in self.completion_matches[:10])
         return "\n".join(lines)
 
-    def render_batch_count(self) -> str:
+    def render_batch_count(self, compact: bool = False) -> str:
         workflow = self.batch_workflow
         if workflow is None:
             return ""
-        lines = [
-            "[bold cyan]Batch Submit[/]",
-            f"Workflow: {escape(workflow.name)}",
-            "",
-            "Enter the number of times to submit this workflow.",
-            "Each submission gets a separate prompt_id and appears in the ComfyUI queue.",
-            "",
-            "Input a positive integer, Enter submits, Esc cancels:",
-        ]
+        if compact:
+            lines = [
+                "[bold cyan]Batch Submit[/]",
+                f"{escape(workflow.name)}",
+                "Enter a positive integer | Enter submits | Esc cancels",
+            ]
+        else:
+            lines = [
+                "[bold cyan]Batch Submit[/]",
+                f"Workflow: {escape(workflow.name)}",
+                "",
+                "Enter the number of times to submit this workflow.",
+                "Each submission gets a separate prompt_id and appears in the ComfyUI queue.",
+                "",
+                "Input a positive integer, Enter submits, Esc cancels:",
+            ]
         if self.input_error:
             lines.append(f"[red]{escape(self.input_error)}[/]")
         return "\n".join(lines)
 
     def render_bottom(self) -> str:
+        compact = self.is_compact_layout()
         status = "online" if self.runtime.online else "offline"
         focus = "[bold cyan]Status[/]" if self.focus_area == "bottom" else "[bold]Status[/]"
         error_count = 1 if self.runtime.last_error else 0
         lines = [
             f"{focus} ComfyUI {status} | running {color_count(len(self.runtime.running), 'yellow')} | "
             f"pending {color_count(len(self.runtime.pending), 'cyan')} | "
+            f"success {color_count(self.runtime.recent_success_count, 'blue')} | "
             f"recent {color_count(len(self.runtime.recent), 'green')} | "
             f"error {color_count(error_count, 'red')}",
         ]
@@ -1239,7 +1293,7 @@ class ComfyHelperApp(App[None]):
             lines.append("Running: none")
 
         if self.runtime.pending:
-            height_budget = 2
+            height_budget = 1 if compact else 2
             start = max(0, min(self.pending_index - height_budget // 2, len(self.runtime.pending) - height_budget))
             end = min(len(self.runtime.pending), start + height_budget)
             for index, item in enumerate(self.runtime.pending[start:end], start=start):
@@ -1263,10 +1317,14 @@ class ComfyHelperApp(App[None]):
             lines.append(f"Msg: {escape(self.runtime.messages[0])}")
         else:
             lines.append("Msg: none")
-        while len(lines) < 6:
-            lines.append("")
-        lines.append(self.help_text())
+        if not compact:
+            while len(lines) < 6:
+                lines.append("")
+            lines.append(self.help_text())
         return "\n".join(lines)
+
+    def is_compact_layout(self) -> bool:
+        return self.size.width < MIN_WIDTH or self.size.height < MIN_HEIGHT
 
     def node_percent(self, prompt_id: str) -> int:
         total = self.session_total_nodes.get(prompt_id)
@@ -1318,11 +1376,26 @@ class ComfyHelperApp(App[None]):
     def mark_cached_node(self, prompt_id: str, node_id: str) -> None:
         self.session_cached_nodes.setdefault(prompt_id, set()).add(node_id)
 
+    def cleanup_finished_prompts(self, active_prompt_ids: set[str]) -> None:
+        finished_prompt_ids = {
+            prompt_id
+            for prompt_id in self.session_tasks
+            if prompt_id not in active_prompt_ids and prompt_id in self.session_finished
+        }
+        for prompt_id in finished_prompt_ids:
+            self.session_tasks.pop(prompt_id, None)
+            self.session_total_nodes.pop(prompt_id, None)
+            self.session_executed_nodes.pop(prompt_id, None)
+            self.session_cached_nodes.pop(prompt_id, None)
+            self.runtime.progress.pop(prompt_id, None)
+            self.runtime.current_node.pop(prompt_id, None)
+            self.session_finished.discard(prompt_id)
+
     def help_text(self) -> str:
         if self.confirm_message:
             return "q/Enter/y confirm | Esc/n cancel" if self.quit_confirm_pending else "Enter/y confirm | Esc/n cancel"
         if self.mode == "input":
-            return "Enter next | b/:batch batch | :seed random | :run submit | Tab complete | Esc cancel"
+            return "Enter next | F2 fill current | b/:batch batch | :seed random | :run submit | Tab complete | Esc cancel"
         if self.mode == "batch_count":
             return "Enter submit batch | positive integer only | Esc cancel"
         return "↑↓ sel | Enter run | b batch | u repeat | Tab | r/s refresh | i/d/c queue | q quit"
