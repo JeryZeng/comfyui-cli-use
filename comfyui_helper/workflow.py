@@ -79,8 +79,10 @@ def validate_workflow(
 
     fields: list[ConfigField] = []
     unsupported_count = 0
+    node_order = output_driven_node_order(data)
 
-    for node_id, node in data.items():
+    for node_id in node_order:
+        node = data[node_id]
         if not isinstance(node, dict):
             return _invalid(name, path, modified, f'Node "{node_id}" must be an object.')
         if "class_type" not in node:
@@ -162,6 +164,52 @@ def validate_workflow(
         unsupported_count=unsupported_count,
         data=data,
     )
+
+
+def output_driven_node_order(data: dict[str, Any]) -> list[str]:
+    original_order = list(data.keys())
+    original_index = {node_id: index for index, node_id in enumerate(original_order)}
+    incoming: dict[str, list[str]] = {node_id: [] for node_id in original_order}
+    outgoing: dict[str, set[str]] = {node_id: set() for node_id in original_order}
+
+    for node_id, node in data.items():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs", {})
+        if not isinstance(inputs, dict):
+            continue
+        seen_upstream: set[str] = set()
+        for value in inputs.values():
+            if not (isinstance(value, (list, tuple)) and len(value) >= 2):
+                continue
+            upstream = value[0]
+            if not isinstance(upstream, str) or upstream not in data:
+                continue
+            if upstream in seen_upstream:
+                continue
+            seen_upstream.add(upstream)
+            incoming[node_id].append(upstream)
+            if node_id not in outgoing[upstream]:
+                outgoing[upstream].add(node_id)
+
+    ordered: list[str] = []
+    visited: set[str] = set()
+
+    def visit(node_id: str) -> None:
+        if node_id in visited:
+            return
+        visited.add(node_id)
+        for upstream in incoming[node_id]:
+            visit(upstream)
+        ordered.append(node_id)
+
+    sinks = sorted((node_id for node_id, targets in outgoing.items() if not targets), key=original_index.get)
+    for node_id in sinks:
+        visit(node_id)
+    for node_id in original_order:
+        visit(node_id)
+
+    return ordered
 
 
 def apply_field_values(workflow: dict[str, Any], values: dict[tuple[str, str], Any]) -> dict[str, Any]:

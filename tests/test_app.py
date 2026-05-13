@@ -5,11 +5,12 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from comfyui_helper.app import ComfyHelperApp, ImageBatch, LastSubmission, RandomSeedValue, format_field_value
 from comfyui_helper.state import QueueItem, RecentItem
-from comfyui_helper.workflow import ConfigField, WorkflowInfo
+from comfyui_helper.workflow import ConfigField, WorkflowInfo, validate_workflow
 
 
 class ComfyHelperAppTests(unittest.IsolatedAsyncioTestCase):
@@ -199,7 +200,7 @@ class ComfyHelperAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(fake_input.cursor_position, len("/tmp/images"))
             self.assertEqual(
                 fake_input.placeholder,
-                "Enter keeps current, :run submits now, F2 fills current, F7 clears input, F3 previous, Esc cancels",
+                "Enter keeps current, :run submits now, F2 fills current, F7 clears input, F3 previous, Esc cancels, Tab completes paths",
             )
         finally:
             await app.client.close()
@@ -313,6 +314,118 @@ class ComfyHelperAppTests(unittest.IsolatedAsyncioTestCase):
         app.workflows = [workflow]
         panel = app.render_workflow_history_panel()
         self.assertIn("No submission history yet.", panel)
+
+    def test_validate_workflow_orders_fields_by_topology_not_node_id(self) -> None:
+        workflow = validate_workflow(
+            "demo",
+            self.root / "workflows" / "demo.json",
+            0.0,
+            {
+                "20": {
+                    "inputs": {
+                        "prompt": "",
+                        "image": ["10", 0],
+                    },
+                    "class_type": "TextEncodeQwenImageEditPlus",
+                    "_meta": {"title": "Node 20", "configurable": ["prompt"]},
+                },
+                "10": {
+                    "inputs": {
+                        "image": "a.png",
+                    },
+                    "class_type": "LoadImage",
+                    "_meta": {"title": "Node 10", "configurable": ["image"]},
+                },
+            },
+        )
+        self.assertTrue(workflow.valid)
+        self.assertEqual([field.node_id for field in workflow.fields], ["10", "20"])
+
+    def test_validate_workflow_orders_independent_sources_by_output_branch_order(self) -> None:
+        workflow = validate_workflow(
+            "demo",
+            self.root / "workflows" / "demo.json",
+            0.0,
+            {
+                "30": {
+                    "inputs": {
+                        "prompt": "",
+                        "image": ["10", 0],
+                    },
+                    "class_type": "TextEncodeQwenImageEditPlus",
+                    "_meta": {"title": "Node 30", "configurable": ["prompt"]},
+                },
+                "20": {
+                    "inputs": {
+                        "prompt": "",
+                        "image": ["11", 0],
+                    },
+                    "class_type": "TextEncodeQwenImageEditPlus",
+                    "_meta": {"title": "Node 20", "configurable": ["prompt"]},
+                },
+                "10": {
+                    "inputs": {
+                        "image": "a.png",
+                    },
+                    "class_type": "LoadImage",
+                    "_meta": {"title": "Node 10", "configurable": ["image"]},
+                },
+                "11": {
+                    "inputs": {
+                        "image": "b.png",
+                    },
+                    "class_type": "LoadImage",
+                    "_meta": {"title": "Node 11", "configurable": ["image"]},
+                },
+            },
+        )
+        self.assertTrue(workflow.valid)
+        self.assertEqual([field.node_id for field in workflow.fields], ["10", "30", "11", "20"])
+
+    def test_render_all_compact_layout_expands_left_panel(self) -> None:
+        app = self.make_app()
+        app.is_mounted = True
+
+        class FakeWidget:
+            def __init__(self) -> None:
+                self.styles = SimpleNamespace(width=None, padding_right=None)
+                self.hidden = False
+                self.content = None
+
+            def add_class(self, name: str) -> None:
+                if name == "hidden":
+                    self.hidden = True
+
+            def remove_class(self, name: str) -> None:
+                if name == "hidden":
+                    self.hidden = False
+
+            def update(self, content: str) -> None:
+                self.content = content
+
+        top = FakeWidget()
+        top_left_container = FakeWidget()
+        top_left_content = FakeWidget()
+        top_right = FakeWidget()
+        bottom = FakeWidget()
+
+        def fake_query_one(selector: str, _widget_type: object) -> FakeWidget:
+            return {
+                "#top": top,
+                "#top_left": top_left_container,
+                "#top_left_content": top_left_content,
+                "#top_right": top_right,
+                "#bottom": bottom,
+            }[selector]
+
+        with patch.object(app, "query_one", side_effect=fake_query_one), patch.object(app, "is_compact_layout", return_value=True):
+            app.render_all()
+
+        self.assertEqual(top_left_container.styles.width, "100%")
+        self.assertEqual(top_left_container.styles.padding_right, 0)
+        self.assertTrue(top_right.hidden)
+        self.assertIsInstance(top_left_content.content, str)
+        self.assertIn("Workflow Runner", top_left_content.content)
 
     async def test_refresh_workflow_history_cache_loads_disk_history_into_right_panel(self) -> None:
         app = self.make_app()
@@ -570,6 +683,53 @@ class ComfyHelperAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(len(matches), 2)
             self.assertTrue(matches[0].endswith("/"))
             self.assertFalse(matches[1].endswith("/"))
+        finally:
+            await app.client.close()
+
+    async def test_complete_path_supports_fields_whose_name_contains_path(self) -> None:
+        app = self.make_app()
+        base = self.root / "paths"
+        base.mkdir()
+        (base / "dir_a").mkdir()
+        (base / "file_a.txt").write_text("x", encoding="utf-8")
+        try:
+            workflow = WorkflowInfo(
+                name="path-workflow",
+                path=self.root / "workflows" / "path-workflow.json",
+                modified=0.0,
+                valid=True,
+                error=None,
+                fields=[ConfigField("1", "PrimitiveString", None, "output_path", "", True, False)],
+                unsupported_count=0,
+                data={},
+            )
+            app.active_workflow = workflow
+            app.mode = "input"
+            app.active_field_index = 0
+
+            class FakeInput:
+                def __init__(self) -> None:
+                    self.value = str(base) + "/"
+                    self.cursor_position = len(self.value)
+                    self.placeholder = ""
+                    self.can_focus = True
+
+                def add_class(self, _name: str) -> None:
+                    pass
+
+                def remove_class(self, _name: str) -> None:
+                    pass
+
+                def focus(self) -> None:
+                    pass
+
+            fake_input = FakeInput()
+            with patch.object(app, "query_one", return_value=fake_input), patch.object(app, "render_all"):
+                app.complete_path()
+
+            self.assertEqual(fake_input.value, str(base) + "/")
+            self.assertIn(str(base / "dir_a") + "/", app.completion_matches)
+            self.assertIn(str(base / "file_a.txt"), app.completion_matches)
         finally:
             await app.client.close()
 

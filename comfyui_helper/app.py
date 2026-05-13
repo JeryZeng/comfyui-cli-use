@@ -84,6 +84,7 @@ class ComfyHelperApp(App[None]):
 
     #top_left_content {
         height: 1fr;
+        width: 100%;
     }
 
     #param_input {
@@ -579,10 +580,11 @@ class ComfyHelperApp(App[None]):
         while self.active_field_index < len(workflow.fields):
             field = workflow.fields[self.active_field_index]
             if field.supported:
+                placeholder = self.input_placeholder_for_field(field)
                 self.show_param_input(
                     field,
                     preset_value="",
-                    placeholder="Enter keeps current, :run submits now, F2 fills current, F7 clears input, F3 previous, Esc cancels",
+                    placeholder=placeholder,
                 )
                 self.render_all()
                 return
@@ -757,7 +759,7 @@ class ComfyHelperApp(App[None]):
                 self.show_param_input(
                     field,
                     preset_value=self.field_value_to_input_text(current),
-                    placeholder="Enter keeps current, :run submits now, F2 fills current, F7 clears input, F3 previous, Esc cancels",
+                    placeholder=self.input_placeholder_for_field(field),
                 )
                 self.render_all()
                 return
@@ -981,7 +983,7 @@ class ComfyHelperApp(App[None]):
         if workflow is None:
             return
         field = workflow.fields[self.active_field_index]
-        if not field.is_load_image:
+        if not self.can_complete_path_for_field(field):
             return
         param_input = self.query_one("#param_input", Input)
         raw = param_input.value.strip()
@@ -1056,6 +1058,15 @@ class ComfyHelperApp(App[None]):
     def is_param_input_focused(self) -> bool:
         param_input = self.query_one("#param_input", Input)
         return bool(getattr(param_input, "has_focus", False))
+
+    def can_complete_path_for_field(self, field: ConfigField) -> bool:
+        return field.is_load_image or "path" in field.name.lower()
+
+    def input_placeholder_for_field(self, field: ConfigField) -> str:
+        placeholder = "Enter keeps current, :run submits now, F2 fills current, F7 clears input, F3 previous, Esc cancels"
+        if self.can_complete_path_for_field(field):
+            placeholder += ", Tab completes paths"
+        return placeholder
 
     def field_value_to_input_text(self, value: Any) -> str:
         if isinstance(value, RandomSeedValue):
@@ -1358,17 +1369,23 @@ class ComfyHelperApp(App[None]):
     def render_all(self) -> None:
         if not self.is_mounted:
             return
-        top_left = self.query_one("#top_left_content", Static)
+        top = self.query_one("#top", Horizontal)
+        top_left_container = self.query_one("#top_left", Vertical)
+        top_left_content = self.query_one("#top_left_content", Static)
         top_right = self.query_one("#top_right", Static)
         compact = self.is_compact_layout()
         if compact:
-            top_left.styles.width = "100%"
+            top.styles.width = "100%"
+            top_left_container.styles.width = "100%"
+            top_left_container.styles.padding_right = 0
             top_right.add_class("hidden")
         else:
-            top_left.styles.width = "70%"
+            top.styles.width = "100%"
+            top_left_container.styles.width = "70%"
+            top_left_container.styles.padding_right = 1
             top_right.styles.width = "30%"
             top_right.remove_class("hidden")
-        top_left.update(self.render_top())
+        top_left_content.update(self.render_top())
         top_right.update(self.render_workflow_history_panel())
         self.query_one("#bottom", Static).update(self.render_bottom())
 
@@ -1409,12 +1426,12 @@ class ComfyHelperApp(App[None]):
         lines.append("")
         lines.append("Last submission values:")
         field_map = {(field.node_id, field.name): field for field in workflow.fields}
+        field_order = {field_key: index for index, field_key in enumerate((field.node_id, field.name) for field in workflow.fields)}
         items = sorted(
             history.values.items(),
             key=lambda item: (
-                0 if item[0][0].isdigit() else 1,
-                int(item[0][0]) if item[0][0].isdigit() else item[0][0],
-                item[0][1],
+                field_order.get(self.deserialize_field_key(item[0]) or ("", ""), len(workflow.fields)),
+                item[0],
             ),
         )
         for index, (key_text, value) in enumerate(items):
@@ -1501,12 +1518,11 @@ class ComfyHelperApp(App[None]):
             ]
             if isinstance(field.value, int) and not isinstance(field.value, bool):
                 lines.append("Use :seed for a new random integer on every submission.")
-            if field.is_load_image:
+            if self.can_complete_path_for_field(field):
                 if self.config.comfyui_dir is None:
-                    lines.append("LoadImage.image accepts a local file or directory. Tab completes paths.")
+                    lines.append("This field accepts a local file or directory. Tab completes paths.")
                 else:
-                    lines.append(
-                        "LoadImage.image file or directory will be copied into ComfyUI input. Tab completes paths.")
+                    lines.append("This field file or directory will be copied into ComfyUI input. Tab completes paths.")
         if self.input_error:
             lines.append(f"[red]{escape(self.input_error)}[/]")
         if self.completion_matches:
