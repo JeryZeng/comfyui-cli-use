@@ -54,6 +54,42 @@ ComfyUI is expected at:
 http://127.0.0.1:8188
 ```
 
+## Configurable Fields
+
+The app only exposes fields that are listed in each node's `_meta.configurable` array.
+
+Example:
+
+```json
+{
+  "117": {
+    "class_type": "PrimitiveInt",
+    "inputs": {
+      "value": 0
+    },
+    "_meta": {
+      "title": "Seed",
+      "configurable": ["value"]
+    }
+  }
+}
+```
+
+Rules:
+
+- Each item in `_meta.configurable` must match a key in that node's `inputs` object exactly.
+- A configurable field must be editable by the CLI. Supported field types are strings, integers, floats, and booleans.
+- `LoadImage.image` is a special case. It accepts a local file path or a directory path, and the CLI treats it as a path-based input instead of a plain string.
+- If a configured field name contains `path`, the CLI also enables path completion for it.
+- Fields not listed in `_meta.configurable` are ignored by guided input, even if they exist in the workflow JSON.
+
+Effects in the TUI:
+
+- The guided input flow walks through configurable fields in workflow graph order.
+- Each configurable field can be edited individually from the keyboard.
+- The right-side history panel shows the last submitted value for each configurable field.
+- Saved workflow history also only tracks configurable fields.
+
 ## Basic Controls
 
 - `Enter`: run the selected workflow once.
