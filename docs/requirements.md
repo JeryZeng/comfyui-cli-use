@@ -9,7 +9,7 @@ The tool starts directly in an interactive TUI. Users select a workflow JSON fro
 ## First-Version Scope
 
 - Full-screen TUI, not a shell-style REPL.
-- Fixed ComfyUI server address: `127.0.0.1:8188`.
+- Configurable ComfyUI server address, defaulting to `127.0.0.1:8188` when not set.
 - Workflow files are ComfyUI API-format JSON files.
 - Workflow files are discovered recursively from a configured directory.
 - Users can run selected workflows from the TUI.
@@ -48,6 +48,7 @@ Default config:
 ```yaml
 workflow_dir: ./workflows
 refresh_interval: 1.0
+comfyui_server: http://127.0.0.1:8188
 # comfyui_dir: /root/ComfyUI
 ```
 
@@ -59,6 +60,9 @@ Rules:
 - `workflow_dir` relative paths are resolved from the current working directory.
 - `refresh_interval` is in seconds and may be a float.
 - No strict range is enforced for `refresh_interval`.
+- `comfyui_server` is optional. If set, it overrides the ComfyUI base URL used for HTTP and WebSocket connections.
+- If `comfyui_server` does not include a scheme, `http://` is assumed.
+- If `comfyui_server` uses `https://`, the WebSocket URL follows as `wss://`.
 - `comfyui_dir` is optional. If set, `LoadImage.image` files are copied into `comfyui_dir/input` before submission.
 - While editing a field, `F2` fills the current field value back into the input box.
 - While editing a field, `F7` clears the current input box content.

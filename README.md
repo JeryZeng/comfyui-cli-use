@@ -27,14 +27,19 @@ The app reads optional project config from:
 ./comfy-helper.yaml
 ```
 
+Copy `comfy-helper.yaml.example` to `comfy-helper.yaml` to create a local config file.
+
 Default config:
 
 ```yaml
 workflow_dir: ./workflows
 refresh_interval: 1.0
+comfyui_server: http://127.0.0.1:8188
 # comfyui_dir: /root/ComfyUI
 ```
 
+If `comfyui_server` is not set, the app uses `http://127.0.0.1:8188`.
+If you omit the scheme, the app assumes `http://` and derives the WebSocket URL from that scheme. If you set `https://`, the WebSocket URL follows as `wss://`.
 If `comfyui_dir` is set, `LoadImage` files are copied into `comfyui_dir/input` before submission.
 Directory inputs are expanded into one prompt per image file.
 When a directory contains multiple image files, the app asks whether to shuffle file order for that run. The choice is stored with the directory value and reused by `u` repeat and history restore.

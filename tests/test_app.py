@@ -4,11 +4,14 @@ import asyncio
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from comfyui_helper.app import ComfyHelperApp, ImageBatch, LastSubmission, RandomSeedValue, format_field_value
+from comfyui_helper.client import ComfyClient
+from comfyui_helper.config import DEFAULT_COMFYUI_SERVER, load_config
 from comfyui_helper.state import QueueItem, RecentItem
 from comfyui_helper.workflow import ConfigField, WorkflowInfo, validate_workflow
 
@@ -426,6 +429,70 @@ class ComfyHelperAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(top_right.hidden)
         self.assertIsInstance(top_left_content.content, str)
         self.assertIn("Workflow Runner", top_left_content.content)
+
+    def test_render_bottom_highlights_selected_pending_item_and_shows_wait_seconds(self) -> None:
+        app = self.make_app()
+        app.focus_area = "bottom"
+        app.pending_index = 1
+        app.runtime.pending = [
+            QueueItem("p1", "1", "wf1", raw=None, queued_at=datetime.now()),
+            QueueItem("p2", "2", "wf2", raw=None, queued_at=datetime.now()),
+        ]
+        bottom = app.render_bottom()
+        self.assertIn("wait", bottom)
+        self.assertIn("wf2", bottom)
+        self.assertIn("p2", bottom)
+
+    async def test_refresh_status_preserves_pending_wait_time_across_refreshes(self) -> None:
+        app = self.make_app()
+        try:
+            app.session_tasks["p1"] = "demo"
+            first = datetime(2026, 1, 1, 12, 0, 0)
+            second = datetime(2026, 1, 1, 12, 0, 10)
+            queue_payload = {"queue_running": [], "queue_pending": [["1", "p1"]]}
+            with patch.object(app.client, "queue", new=AsyncMock(return_value=queue_payload)), patch(
+                "comfyui_helper.app.datetime"
+            ) as mock_datetime:
+                mock_datetime.now.side_effect = [first, second]
+                await app.refresh_status()
+                self.assertEqual(app.runtime.pending[0].queued_at, first)
+                await app.refresh_status()
+                self.assertEqual(app.runtime.pending[0].queued_at, first)
+        finally:
+            await app.client.close()
+
+    def test_load_config_uses_default_comfyui_server_when_missing(self) -> None:
+        config = load_config(self.root)
+        self.assertEqual(config.comfyui_server, DEFAULT_COMFYUI_SERVER)
+
+    def test_load_config_reads_custom_comfyui_server(self) -> None:
+        (self.root / "comfy-helper.yaml").write_text("comfyui_server: 10.0.0.5:9000\n", encoding="utf-8")
+        config = load_config(self.root)
+        self.assertEqual(config.comfyui_server, "10.0.0.5:9000")
+
+    def test_help_text_expands_queue_actions(self) -> None:
+        app = self.make_app()
+        help_text = app.help_text()
+        self.assertIn("select workflow", help_text)
+        self.assertIn("interrupt current running task", help_text)
+        self.assertIn("clear all pending tasks", help_text)
+        self.assertIn("delete selected pending task", help_text)
+
+    async def test_comfy_client_normalizes_http_and_https_urls(self) -> None:
+        client = ComfyClient("https://example.com:8188")
+        try:
+            self.assertEqual(client.base_url, "https://example.com:8188")
+            self.assertEqual(client.ws_url, "wss://example.com:8188/ws")
+        finally:
+            await client.close()
+
+    async def test_comfy_client_defaults_to_http_without_scheme(self) -> None:
+        client = ComfyClient("example.com:8188")
+        try:
+            self.assertEqual(client.base_url, "http://example.com:8188")
+            self.assertEqual(client.ws_url, "ws://example.com:8188/ws")
+        finally:
+            await client.close()
 
     async def test_refresh_workflow_history_cache_loads_disk_history_into_right_panel(self) -> None:
         app = self.make_app()

@@ -37,6 +37,7 @@ from comfyui_helper.workflow import (
 MIN_WIDTH = 78
 MIN_HEIGHT = 24
 SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+FIXED_CLIENT_ID = "comfyui-helper"
 
 
 @dataclass(frozen=True)
@@ -123,8 +124,8 @@ class ComfyHelperApp(App[None]):
     def __init__(self) -> None:
         super().__init__()
         self.config: AppConfig = load_config()
-        self.client = ComfyClient()
-        self.client_id = str(uuid.uuid4())
+        self.client = ComfyClient(self.config.comfyui_server)
+        self.client_id = FIXED_CLIENT_ID
         self.runtime = RuntimeState()
         self.workflows: list[WorkflowInfo] = []
         self.workflow_index = 0
@@ -1187,8 +1188,19 @@ class ComfyHelperApp(App[None]):
             self.add_message("ComfyUI connection restored.")
         self.runtime.online = True
         self.runtime.last_error = None
-        self.runtime.running = parse_queue_items(queue.get("queue_running", []), self.session_tasks)
-        self.runtime.pending = parse_queue_items(queue.get("queue_pending", []), self.session_tasks)
+        now = datetime.now()
+        self.runtime.running = parse_queue_items(
+            queue.get("queue_running", []),
+            self.session_tasks,
+            self.runtime.queue_seen_at,
+            now=now,
+        )
+        self.runtime.pending = parse_queue_items(
+            queue.get("queue_pending", []),
+            self.session_tasks,
+            self.runtime.queue_seen_at,
+            now=now,
+        )
         self.sync_queue_totals(self.runtime.running + self.runtime.pending)
         active_prompt_ids = {item.prompt_id for item in self.runtime.running + self.runtime.pending}
         self.cleanup_finished_prompts(active_prompt_ids)
@@ -1589,9 +1601,14 @@ class ComfyHelperApp(App[None]):
             end = min(len(self.runtime.pending), start + height_budget)
             for index, item in enumerate(self.runtime.pending[start:end], start=start):
                 marker = ">" if self.focus_area == "bottom" and index == self.pending_index else " "
-                lines.append(
-                    f"Pending: {marker} {escape(item.number):>6} {escape(item.workflow_name)} {short_id(item.prompt_id)}"
+                wait_seconds = max(0, int((datetime.now() - item.queued_at).total_seconds()))
+                line = (
+                    f"Pending: {marker} {escape(item.number):>6} {escape(item.workflow_name)} "
+                    f"{short_id(item.prompt_id)} wait {wait_seconds}s"
                 )
+                if self.focus_area == "bottom" and index == self.pending_index:
+                    line = f"[reverse bold cyan]{line}[/]"
+                lines.append(line)
         else:
             lines.append("Pending: none")
 
@@ -1681,6 +1698,7 @@ class ComfyHelperApp(App[None]):
             self.runtime.progress.pop(prompt_id, None)
             self.runtime.current_node.pop(prompt_id, None)
             self.session_finished.discard(prompt_id)
+            self.runtime.queue_seen_at.pop(prompt_id, None)
 
     def help_text(self) -> str:
         if self.shuffle_prompt_message:
@@ -1691,7 +1709,7 @@ class ComfyHelperApp(App[None]):
             return "Enter next | F2 fill current | F7 clear input | F3 previous | b/:batch batch | :seed random | :run submit | Tab complete | Esc cancel"
         if self.mode == "batch_count":
             return "Enter submit batch | positive integer only | Esc cancel"
-        return "↑↓ sel | Enter run | b batch | u repeat | Tab | r/s refresh | i/d/c queue | q quit"
+        return "↑↓ sel | Enter run | b batch | u repeat | Tab | r reload | s refresh | i interrupt | d delete pending | c clear queue | q quit"
 
     def clear_completion(self) -> None:
         self.completion_matches = []

@@ -8,6 +8,7 @@ import yaml
 
 DEFAULT_WORKFLOW_DIR = "./workflows"
 DEFAULT_REFRESH_INTERVAL = 1.0
+DEFAULT_COMFYUI_SERVER = "http://127.0.0.1:8188"
 
 
 @dataclass(frozen=True)
@@ -16,6 +17,7 @@ class AppConfig:
     refresh_interval: float
     messages: list[str] = field(default_factory=list)
     comfyui_dir: Path | None = None
+    comfyui_server: str = DEFAULT_COMFYUI_SERVER
 
 
 def load_config(cwd: Path | None = None) -> AppConfig:
@@ -65,11 +67,17 @@ def load_config(cwd: Path | None = None) -> AppConfig:
         else:
             messages.append("Invalid comfyui_dir; ignoring local ComfyUI copy mode.")
 
+    comfyui_server_value = raw.get("comfyui_server", DEFAULT_COMFYUI_SERVER)
+    if not isinstance(comfyui_server_value, str) or not comfyui_server_value.strip():
+        messages.append("Invalid comfyui_server; using default http://127.0.0.1:8188.")
+        comfyui_server_value = DEFAULT_COMFYUI_SERVER
+
     return AppConfig(
         workflow_dir=(cwd / workflow_dir_value).resolve()
         if not Path(workflow_dir_value).is_absolute()
         else Path(workflow_dir_value),
         refresh_interval=refresh_interval,
         comfyui_dir=comfyui_dir,
+        comfyui_server=comfyui_server_value.strip(),
         messages=messages,
     )
