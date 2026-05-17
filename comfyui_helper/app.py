@@ -7,7 +7,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import random
 import secrets
 import shutil
@@ -39,8 +38,6 @@ MIN_WIDTH = 78
 MIN_HEIGHT = 24
 SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 FIXED_CLIENT_ID = "comfyui-helper"
-TEMPLATE_REF_PATTERN = re.compile(r"\$\{([^}]+)\}")
-EXACT_TEMPLATE_REF_PATTERN = re.compile(r"^\$\{([^}]+)\}$")
 
 
 @dataclass(frozen=True)
@@ -1102,27 +1099,67 @@ class ComfyHelperApp(App[None]):
         return str(value)
 
     def contains_template_reference(self, value_text: str) -> bool:
-        return "${" in value_text and bool(TEMPLATE_REF_PATTERN.search(value_text))
+        return bool(self.extract_template_references(value_text))
 
     def is_single_template_reference(self, value_text: str) -> tuple[str, str] | None:
-        match = EXACT_TEMPLATE_REF_PATTERN.fullmatch(value_text)
-        if match is None:
+        parts = self.parse_template_parts(value_text)
+        if len(parts) != 1:
             return None
-        field_key = self.deserialize_field_key(match.group(1))
-        if field_key is None:
+        kind, value = parts[0]
+        if kind != "ref":
             return None
-        return field_key
+        return value
 
     def extract_template_references(self, value_text: str) -> list[tuple[str, str]]:
         references: list[tuple[str, str]] = []
         seen: set[tuple[str, str]] = set()
-        for match in TEMPLATE_REF_PATTERN.finditer(value_text):
-            field_key = self.deserialize_field_key(match.group(1))
-            if field_key is None or field_key in seen:
+        for kind, value in self.parse_template_parts(value_text):
+            if kind != "ref" or value in seen:
                 continue
-            seen.add(field_key)
-            references.append(field_key)
+            seen.add(value)
+            references.append(value)
         return references
+
+    def parse_template_parts(self, value_text: str) -> list[tuple[str, str | tuple[str, str]]]:
+        parts: list[tuple[str, str | tuple[str, str]]] = []
+        index = 0
+        literal: list[str] = []
+        while index < len(value_text):
+            if value_text.startswith("${", index):
+                end = value_text.find("}", index + 2)
+                if end == -1:
+                    literal.append(value_text[index])
+                    index += 1
+                    continue
+                ref_text = value_text[index + 2:end]
+                field_key = self.deserialize_field_key(ref_text)
+                if field_key is None:
+                    literal.append(value_text[index:end + 1])
+                    index = end + 1
+                    continue
+                slash_count = 0
+                for char in reversed(literal):
+                    if char != "\\":
+                        break
+                    slash_count += 1
+                if slash_count:
+                    del literal[-slash_count:]
+                    literal.extend("\\" * (slash_count // 2))
+                if slash_count % 2 == 1:
+                    literal.append(value_text[index:end + 1])
+                    index = end + 1
+                    continue
+                if literal:
+                    parts.append(("text", "".join(literal)))
+                    literal = []
+                parts.append(("ref", field_key))
+                index = end + 1
+                continue
+            literal.append(value_text[index])
+            index += 1
+        if literal:
+            parts.append(("text", "".join(literal)))
+        return parts
 
     def template_field_dependencies(
             self,
@@ -1212,22 +1249,24 @@ class ComfyHelperApp(App[None]):
             resolved_values: dict[tuple[str, str], Any],
             branch_image: str | None = None,
     ) -> str:
-        def replace(match: re.Match[str]) -> str:
-            field_key = self.deserialize_field_key(match.group(1))
-            if field_key is None:
-                raise ValueError(f"Invalid template reference: {match.group(0)}")
+        chunks: list[str] = []
+        for kind, value in self.parse_template_parts(value_text):
+            if kind == "text":
+                chunks.append(str(value))
+                continue
+            field_key = value
             if field_key not in resolved_values:
                 raise ValueError(f"Referenced field not resolved: {field_key[0]}/{field_key[1]}")
-            value = resolved_values[field_key]
-            if isinstance(value, RandomSeedValue):
+            referenced_value = resolved_values[field_key]
+            if isinstance(referenced_value, RandomSeedValue):
                 raise ValueError("Random seed values must be resolved before template substitution.")
-            if isinstance(value, ImageBatch):
+            if isinstance(referenced_value, ImageBatch):
                 if branch_image is None:
                     raise ValueError("Image batch values must be resolved before template substitution.")
-                return branch_image
-            return str(value)
-
-        return TEMPLATE_REF_PATTERN.sub(replace, value_text)
+                chunks.append(branch_image)
+            else:
+                chunks.append(str(referenced_value))
+        return "".join(chunks)
 
     def coerce_template_reference(self, field: ConfigField, value: Any) -> Any:
         if isinstance(field.value, bool):

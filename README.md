@@ -84,6 +84,7 @@ Rules:
 - Fields not listed in `_meta.configurable` are ignored by guided input, even if they exist in the workflow JSON.
 - The app resolves fields in workflow dependency order before submission, so a field can reference another field even if that other field appears later in the guided input flow.
 - Template references use `${node_id.field_name}` syntax. A value can be a plain reference like `${117.value}` or a string with embedded references like `prefix_${117.value}_suffix`.
+- Prefix a reference with a backslash to keep it as literal text. For example, `\${117.value}` submits `${117.value}`. Use `\\${117.value}` when you need one literal backslash followed by the resolved reference value.
 - Integer, float, and boolean fields allow whole-field references and keep the referenced type.
 - String fields allow interpolation and coerce referenced values to text during substitution.
 - `LoadImage` values can reference other fields too. If a referenced `LoadImage` field is a directory batch, the reference resolves to the actual image path used by the current prompt branch.

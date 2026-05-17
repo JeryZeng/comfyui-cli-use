@@ -224,6 +224,36 @@ class ComfyHelperAppTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await app.client.close()
 
+    async def test_template_reference_escape_keeps_literal_reference_text(self) -> None:
+        app = self.make_app()
+        try:
+            workflow = WorkflowInfo(
+                name="refs",
+                path=self.root / "workflows" / "refs.json",
+                modified=0.0,
+                valid=True,
+                error=None,
+                fields=[
+                    ConfigField("1", "PrimitiveInt", None, "seed", 7, True, False),
+                    ConfigField("2", "PrimitiveString", None, "prompt", "", True, False),
+                ],
+                unsupported_count=0,
+                data={},
+            )
+            values = {
+                ("1", "seed"): 7,
+                ("2", "prompt"): r"literal=\${1.seed}, escaped_slash=\\${1.seed}",
+            }
+
+            resolved = await app.resolve_submission_values_for_workflow(workflow, values)
+
+            self.assertEqual(
+                resolved[0][("2", "prompt")],
+                r"literal=${1.seed}, escaped_slash=\7",
+            )
+        finally:
+            await app.client.close()
+
     def test_format_field_value_shows_image_batch_shuffle_state(self) -> None:
         value = ImageBatch(source="/tmp/images", images=["a.png", "b.png"], shuffle=True)
         self.assertEqual(format_field_value(value), "2 images from /tmp/images (shuffled)")
