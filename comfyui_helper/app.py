@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import random
 import secrets
 import shutil
@@ -38,6 +39,8 @@ MIN_WIDTH = 78
 MIN_HEIGHT = 24
 SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 FIXED_CLIENT_ID = "comfyui-helper"
+TEMPLATE_REF_PATTERN = re.compile(r"\$\{([^}]+)\}")
+EXACT_TEMPLATE_REF_PATTERN = re.compile(r"^\$\{([^}]+)\}$")
 
 
 @dataclass(frozen=True)
@@ -520,9 +523,10 @@ class ComfyHelperApp(App[None]):
         return f"{field_key[0]}|{field_key[1]}"
 
     def deserialize_field_key(self, key_text: str) -> tuple[str, str] | None:
-        if "|" not in key_text:
+        separator = "|" if "|" in key_text else "." if "." in key_text else None
+        if separator is None:
             return None
-        node_id, field_name = key_text.split("|", 1)
+        node_id, field_name = key_text.split(separator, 1)
         if not node_id or not field_name:
             return None
         return node_id, field_name
@@ -689,10 +693,16 @@ class ComfyHelperApp(App[None]):
 
     async def parse_field_value(self, field: ConfigField, value_text: str) -> Any:
         if field.is_load_image:
+            if self.contains_template_reference(value_text):
+                return value_text
             return await self.prepare_load_image_value(value_text)
 
         current = field.value
         if isinstance(current, bool):
+            if self.contains_template_reference(value_text):
+                if not self.is_single_template_reference(value_text):
+                    raise ValueError("Only a single reference is allowed for boolean fields.")
+                return value_text
             normalized = value_text.lower()
             if normalized in {"true", "yes", "y", "1", "on"}:
                 return True
@@ -702,11 +712,19 @@ class ComfyHelperApp(App[None]):
         if isinstance(current, int) and not isinstance(current, bool):
             if value_text == ":seed":
                 return RandomSeedValue()
+            if self.contains_template_reference(value_text):
+                if not self.is_single_template_reference(value_text):
+                    raise ValueError("Only a single reference is allowed for integer fields.")
+                return value_text
             try:
                 return int(value_text)
             except ValueError as exc:
                 raise ValueError("Expected an integer value.") from exc
         if isinstance(current, float):
+            if self.contains_template_reference(value_text):
+                if not self.is_single_template_reference(value_text):
+                    raise ValueError("Only a single reference is allowed for float fields.")
+                return value_text
             try:
                 return float(value_text)
             except ValueError as exc:
@@ -934,7 +952,14 @@ class ComfyHelperApp(App[None]):
         # do submit
         submitted: list[str] = []
         for index in range(count):
-            resolved_values_list = self.resolve_submission_values(values)
+            try:
+                resolved_values_list = await self.resolve_submission_values_for_workflow(workflow, values)
+            except Exception as exc:
+                logging.exception("Failed to resolve workflow %s", workflow.name)
+                self.add_message(f"Resolve failed for {workflow.name}: {short_error(exc)}")
+                await self.refresh_status()
+                self.render_all()
+                return
             for batch_index, resolved_values in enumerate(resolved_values_list):
                 prompt_id = str(uuid.uuid4())
                 self.session_tasks[prompt_id] = workflow.name
@@ -1076,6 +1101,228 @@ class ComfyHelperApp(App[None]):
             return value.source
         return str(value)
 
+    def contains_template_reference(self, value_text: str) -> bool:
+        return "${" in value_text and bool(TEMPLATE_REF_PATTERN.search(value_text))
+
+    def is_single_template_reference(self, value_text: str) -> tuple[str, str] | None:
+        match = EXACT_TEMPLATE_REF_PATTERN.fullmatch(value_text)
+        if match is None:
+            return None
+        field_key = self.deserialize_field_key(match.group(1))
+        if field_key is None:
+            return None
+        return field_key
+
+    def extract_template_references(self, value_text: str) -> list[tuple[str, str]]:
+        references: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for match in TEMPLATE_REF_PATTERN.finditer(value_text):
+            field_key = self.deserialize_field_key(match.group(1))
+            if field_key is None or field_key in seen:
+                continue
+            seen.add(field_key)
+            references.append(field_key)
+        return references
+
+    def template_field_dependencies(
+            self,
+            workflow: WorkflowInfo,
+            values: dict[tuple[str, str], Any],
+    ) -> dict[tuple[str, str], set[tuple[str, str]]]:
+        field_map = {(field.node_id, field.name): field for field in workflow.fields}
+        dependencies: dict[tuple[str, str], set[tuple[str, str]]] = {}
+        for field_key, field in field_map.items():
+            raw_value = values.get(field_key, field.value)
+            deps: set[tuple[str, str]] = set()
+            if isinstance(raw_value, str) and self.contains_template_reference(raw_value):
+                for ref_key in self.extract_template_references(raw_value):
+                    if ref_key in field_map and ref_key != field_key:
+                        deps.add(ref_key)
+            dependencies[field_key] = deps
+        return dependencies
+
+    def order_template_fields(
+            self,
+            workflow: WorkflowInfo,
+            values: dict[tuple[str, str], Any],
+    ) -> list[tuple[str, str]]:
+        field_keys = [(field.node_id, field.name) for field in workflow.fields]
+        dependencies = self.template_field_dependencies(workflow, values)
+        original_index = {field_key: index for index, field_key in enumerate(field_keys)}
+        incoming = {field_key: set(dependencies.get(field_key, set())) for field_key in field_keys}
+        outgoing: dict[tuple[str, str], set[tuple[str, str]]] = {field_key: set() for field_key in field_keys}
+        for field_key, deps in incoming.items():
+            for dep in deps:
+                outgoing.setdefault(dep, set()).add(field_key)
+
+        ordered: list[tuple[str, str]] = []
+        ready = [field_key for field_key in field_keys if not incoming[field_key]]
+        ready.sort(key=original_index.get)
+        while ready:
+            field_key = ready.pop(0)
+            ordered.append(field_key)
+            for downstream in sorted(outgoing.get(field_key, set()), key=original_index.get):
+                if field_key in incoming[downstream]:
+                    incoming[downstream].remove(field_key)
+                if not incoming[downstream] and downstream not in ordered and downstream not in ready:
+                    ready.append(downstream)
+                    ready.sort(key=original_index.get)
+
+        if len(ordered) != len(field_keys):
+            raise ValueError("Circular field references detected.")
+        return ordered
+
+    async def resolve_single_field_value(
+            self,
+            field: ConfigField,
+            raw_value: Any,
+            resolved_values: dict[tuple[str, str], Any],
+            field_key: tuple[str, str],
+            branch_image: str | None = None,
+    ) -> Any:
+        if isinstance(raw_value, RandomSeedValue):
+            return secrets.randbits(63)
+
+        if field.is_load_image:
+            if isinstance(raw_value, ImageBatch):
+                return branch_image if branch_image is not None else raw_value
+            if isinstance(raw_value, str):
+                if self.contains_template_reference(raw_value):
+                    resolved_text = self.substitute_template(raw_value, resolved_values, branch_image=branch_image)
+                    return await self.prepare_load_image_value(resolved_text)
+                return raw_value
+            raise ValueError(f"Unsupported LoadImage value type for {field.display_name}.")
+
+        if isinstance(raw_value, str) and self.contains_template_reference(raw_value):
+            single_reference = self.is_single_template_reference(raw_value)
+            if isinstance(field.value, str):
+                return self.substitute_template(raw_value, resolved_values, branch_image=branch_image)
+            if single_reference is None:
+                raise ValueError(f"Field {field.display_name} only supports a single reference.")
+            referenced_value = resolved_values.get(single_reference)
+            if referenced_value is None:
+                raise ValueError(f"Referenced field not resolved: {single_reference[0]}/{single_reference[1]}")
+            return self.coerce_template_reference(field, referenced_value)
+
+        return copy.deepcopy(raw_value)
+
+    def substitute_template(
+            self,
+            value_text: str,
+            resolved_values: dict[tuple[str, str], Any],
+            branch_image: str | None = None,
+    ) -> str:
+        def replace(match: re.Match[str]) -> str:
+            field_key = self.deserialize_field_key(match.group(1))
+            if field_key is None:
+                raise ValueError(f"Invalid template reference: {match.group(0)}")
+            if field_key not in resolved_values:
+                raise ValueError(f"Referenced field not resolved: {field_key[0]}/{field_key[1]}")
+            value = resolved_values[field_key]
+            if isinstance(value, RandomSeedValue):
+                raise ValueError("Random seed values must be resolved before template substitution.")
+            if isinstance(value, ImageBatch):
+                if branch_image is None:
+                    raise ValueError("Image batch values must be resolved before template substitution.")
+                return branch_image
+            return str(value)
+
+        return TEMPLATE_REF_PATTERN.sub(replace, value_text)
+
+    def coerce_template_reference(self, field: ConfigField, value: Any) -> Any:
+        if isinstance(field.value, bool):
+            if isinstance(value, bool):
+                return value
+            raise ValueError(f"Referenced value for {field.display_name} must be boolean.")
+        if isinstance(field.value, int) and not isinstance(field.value, bool):
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+            raise ValueError(f"Referenced value for {field.display_name} must be integer.")
+        if isinstance(field.value, float):
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value)
+            raise ValueError(f"Referenced value for {field.display_name} must be numeric.")
+        return value
+
+    async def resolve_submission_values_for_workflow(
+            self,
+            workflow: WorkflowInfo,
+            values: dict[tuple[str, str], Any],
+    ) -> list[dict[tuple[str, str], Any]]:
+        field_map = {(field.node_id, field.name): field for field in workflow.fields}
+        raw_values = {field_key: copy.deepcopy(values.get(field_key, field.value)) for field_key, field in field_map.items()}
+        ordered_fields = self.order_template_fields(workflow, raw_values)
+        resolved: dict[tuple[str, str], Any] = {}
+        batch_key: tuple[str, str] | None = None
+        batch_value: ImageBatch | None = None
+
+        for field_key in ordered_fields:
+            field = field_map[field_key]
+            value = await self.resolve_single_field_value(field, raw_values[field_key], resolved, field_key)
+            resolved[field_key] = value
+            if isinstance(value, ImageBatch):
+                if batch_key is not None:
+                    raise ValueError("Only one LoadImage directory can be expanded at a time.")
+                batch_key = field_key
+                batch_value = value
+                break
+
+        if batch_key is None:
+            return [resolved]
+
+        assert batch_value is not None
+        images = list(batch_value.images)
+        if batch_value.shuffle and len(images) > 1:
+            random.shuffle(images)
+
+        base_resolved = copy.deepcopy(resolved)
+        batch_index = ordered_fields.index(batch_key)
+        result: list[dict[tuple[str, str], Any]] = []
+        for image in images:
+            branch_values = copy.deepcopy(base_resolved)
+            branch_values[batch_key] = image
+            for field_key in ordered_fields[batch_index + 1 :]:
+                field = field_map[field_key]
+                value = await self.resolve_single_field_value(field, raw_values[field_key], branch_values, field_key, image)
+                if isinstance(value, ImageBatch):
+                    raise ValueError("Only one LoadImage directory can be expanded at a time.")
+                branch_values[field_key] = value
+            result.append(branch_values)
+        return result
+
+    def resolve_submission_values(self, values: dict[tuple[str, str], Any]) -> list[dict[tuple[str, str], Any]]:
+        batch: tuple[tuple[str, str], ImageBatch] | None = None
+        for key, value in values.items():
+            if isinstance(value, ImageBatch):
+                if batch is not None:
+                    raise ValueError("Only one LoadImage directory can be expanded at a time.")
+                batch = (key, value)
+
+        if batch is None:
+            return [self.resolve_single_submission_values(values)]
+
+        field_key, image_batch = batch
+        result: list[dict[tuple[str, str], Any]] = []
+        images = list(image_batch.images)
+        if image_batch.shuffle and len(images) > 1:
+            random.shuffle(images)
+        for image in images:
+            resolved = self.resolve_single_submission_values(values)
+            resolved[field_key] = image
+            result.append(resolved)
+        return result
+
+    def resolve_single_submission_values(self, values: dict[tuple[str, str], Any]) -> dict[tuple[str, str], Any]:
+        resolved: dict[tuple[str, str], Any] = {}
+        for key, value in values.items():
+            if isinstance(value, RandomSeedValue):
+                resolved[key] = secrets.randbits(63)
+            elif isinstance(value, ImageBatch):
+                resolved[key] = value
+            else:
+                resolved[key] = value
+        return resolved
+
     def copy_image_into_comfyui_input(self, image_path: Path) -> str:
         comfyui_dir = self.config.comfyui_dir
         if comfyui_dir is None:
@@ -1117,39 +1364,6 @@ class ComfyHelperApp(App[None]):
                 continue
             image_files.append(path)
         return image_files
-
-    def resolve_submission_values(self, values: dict[tuple[str, str], Any]) -> list[dict[tuple[str, str], Any]]:
-        batch: tuple[tuple[str, str], ImageBatch] | None = None
-        for key, value in values.items():
-            if isinstance(value, ImageBatch):
-                if batch is not None:
-                    raise ValueError("Only one LoadImage directory can be expanded at a time.")
-                batch = (key, value)
-
-        if batch is None:
-            return [self.resolve_single_submission_values(values)]
-
-        field_key, image_batch = batch
-        result: list[dict[tuple[str, str], Any]] = []
-        images = list(image_batch.images)
-        if image_batch.shuffle and len(images) > 1:
-            random.shuffle(images)
-        for image in images:
-            resolved = self.resolve_single_submission_values(values)
-            resolved[field_key] = image
-            result.append(resolved)
-        return result
-
-    def resolve_single_submission_values(self, values: dict[tuple[str, str], Any]) -> dict[tuple[str, str], Any]:
-        resolved: dict[tuple[str, str], Any] = {}
-        for key, value in values.items():
-            if isinstance(value, RandomSeedValue):
-                resolved[key] = secrets.randbits(63)
-            elif isinstance(value, ImageBatch):
-                resolved[key] = value
-            else:
-                resolved[key] = value
-        return resolved
 
     async def poll_loop(self) -> None:
         while True:

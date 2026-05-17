@@ -31,7 +31,7 @@ The tool starts directly in an interactive TUI. Users select a workflow JSON fro
 - No multiple ComfyUI server profiles.
 - No command-line startup arguments.
 - No search/filter for workflow list.
-- No model/sampler/string auto-completion except `LoadImage.image` path completion.
+- No model/sampler/string auto-completion. Path completion is available for `LoadImage.image` and configurable fields whose name contains `path`.
 
 ## Configuration
 
@@ -68,7 +68,7 @@ Rules:
 - While editing a field, `F7` clears the current input box content.
 - While editing a field, `F3` returns to the previous editable field.
 - While editing a field, `Esc` cancels the current workflow run.
-- If `LoadImage.image` points at a directory with multiple image files, the app asks whether to shuffle file order for that run; the choice is preserved in history and reused by `u`.
+- If `LoadImage.image` points at a directory with multiple supported image files, the app asks whether to shuffle file order for that run; the choice is preserved in history and reused by `u`.
 
 Workflow history:
 
@@ -77,6 +77,8 @@ Workflow history:
 - Normal values are stored directly.
 - `:seed` is stored as a random-seed marker.
 - `LoadImage` directory batches are stored as `image_batch` records with the original directory path and shuffle flag.
+- Template references are stored as the original template text, not as resolved values.
+- History is recorded before the HTTP submit request is sent, so a failed submit attempt may update history and the repeat buffer.
 - `data/` is ignored by git.
 
 ## Logging
@@ -89,17 +91,16 @@ Write logs to:
 
 Logs are in English.
 
-Log at least:
+Logging behavior:
 
 - TUI startup and shutdown.
-- Config loading and fallback decisions.
+- YAML parse failures.
 - Workflow scanning errors.
-- Invalid workflow reasons.
-- ComfyUI connection lost/restored.
-- API request errors.
-- Workflow submission result.
-- Queue operations.
-- Unhandled exceptions.
+- Field parsing errors.
+- Workflow submission successes and failures.
+- Queue operation failures.
+- Workflow history read and restore failures.
+- Background polling and spinner exceptions.
 
 ## Workflow Discovery
 
@@ -195,7 +196,7 @@ Rules:
 - Each configurable field must exist in that node's `inputs`.
 - Duplicate fields in the same node are deduplicated, preserving the first occurrence.
 - Same field names across different nodes are allowed.
-- Configurable field order follows JSON node order, then `_meta.configurable` array order.
+- Configurable field order follows workflow graph dependency order, with each node's `_meta.configurable` array order preserved within that node.
 - Configurable field count is based on deduplicated declared fields.
 - Unsupported editable types are counted but skipped during guided input.
 
@@ -226,12 +227,12 @@ Behavior:
 
 - The field accepts a local file path or a directory path.
 - Tab completion is supported for paths.
-- No extension filtering.
+- Directory expansion includes files with `.png`, `.jpg`, `.jpeg`, or `.webp` extensions.
 - If user enters a new path, it must exist.
 - Direct Enter keeps the current workflow value and does not validate it as a local file.
 - If `comfyui_dir` is configured, file paths are copied into `comfyui_dir/input` and directory entries are expanded from the copied files.
 - If `comfyui_dir` is not configured, file paths are uploaded through the ComfyUI API and directory entries are uploaded file by file.
-- A directory path expands to one prompt per image file in that directory.
+- A directory path expands to one prompt per supported image file in that directory.
 
 ## TUI Layout
 
@@ -259,11 +260,7 @@ The upper region switches content:
 
 The lower region remains visible and continues refreshing during parameter input without disturbing input focus or current typed text.
 
-If terminal size is too small, show:
-
-```text
-Terminal too small, please resize.
-```
+If the terminal is small, the app switches to a compact layout and hides the right-side history panel.
 
 ## Workflow Browsing State
 
@@ -333,7 +330,7 @@ Input rules:
 - `:run` skips remaining fields and submits immediately.
 - `:batch` submits with the values entered so far, then asks for a positive integer batch count.
 - `Shift+Enter` does the same when supported by the terminal.
-- Integer fields accept `:seed` to request a fresh random integer at submit time.
+- Integer fields accept `:seed` to request a random integer when submission values are resolved.
 - No final submit confirmation.
 
 ## Batch Submission
@@ -343,9 +340,9 @@ Batch submission is a submit-time variant, not a separate workflow type.
 - A batch count prompt asks for a positive integer `N`.
 - Submitting creates `N` independent ComfyUI prompts.
 - Each prompt gets a unique client-generated `prompt_id`.
-- The same resolved workflow parameters are used for every prompt.
-- If `LoadImage.image` is a directory, it expands to one prompt per image file.
-- If an integer field was set to `:seed`, that field is re-randomized before every prompt submission.
+- Submission values are resolved for each batch iteration.
+- If `LoadImage.image` is a directory, it expands to one prompt per supported image file.
+- If an integer field was set to `:seed`, that field is randomized when its value is resolved. With a directory `LoadImage` batch, fields resolved before the directory batch share one generated value across that directory expansion; fields resolved after the directory batch are resolved per expanded image prompt.
 - If a `LoadImage.image` value was changed to a file, the local file is prepared once during guided input and the final ComfyUI image name is reused for every prompt in the batch.
 - If one submission fails, already submitted prompts remain queued and the app reports how many were submitted before the failure.
 
@@ -371,7 +368,7 @@ Submit result:
 - On success, return to workflow browsing and refresh queue.
 - On failure, return to workflow browsing and show a short error in messages.
 - Detailed error is written to log.
-- Input values are not retained after failure.
+- Input values are recorded before submission and may be retained after failure in history and the repeat buffer.
 
 ## ComfyUI Status and Queue
 
@@ -401,6 +398,7 @@ Progress tracking:
 
 - Focus on tasks submitted by the current TUI session.
 - Unknown tasks may be displayed as busy/unknown without detailed tracking.
+- Initial progress totals are based on workflow node count. Queue payload execution targets are currently not used to refine those totals.
 
 Recent:
 
@@ -454,7 +452,7 @@ Global/main controls:
 Up/Down   select item
 Enter     run selected workflow
 b         run selected workflow as batch
-u         repeat the last successful submission
+u         repeat the last recorded submission
 Shift+Enter run selected workflow as batch if supported by terminal
 Tab       switch focus between upper operation area and lower status area
 r         refresh workflow list
@@ -474,7 +472,7 @@ Enter     keep current value or accept typed value
 Shift+Enter submit values entered so far as batch if supported by terminal
 :run      skip remaining fields and submit now
 Esc       cancel run and return to workflow browsing
-Tab       no focus switch during guided input
+Tab       complete paths for path-capable fields; otherwise no focus switch during guided input
 ```
 
 Batch count controls:
@@ -527,7 +525,7 @@ Keyboard help:
 Resolved for the first implementation:
 
 1. TUI framework: Textual.
-2. `LoadImage.image` local files: copy into `comfyui_dir/input` when `comfyui_dir` is configured; otherwise upload through `POST /upload/image`. Directory inputs expand to one prompt per image file.
+2. `LoadImage.image` local files: copy into `comfyui_dir/input` when `comfyui_dir` is configured; otherwise upload through `POST /upload/image`. Directory inputs expand to one prompt per supported image file.
 3. API paths: bare ComfyUI paths such as `/prompt`, `/queue`, `/ws`.
 4. Progress: WebSocket for current-session task progress plus `/queue` polling for global queue state.
 5. Prompt identity: generate UUID `prompt_id` client-side and submit with a session `client_id`.

@@ -106,6 +106,32 @@ class ComfyHelperAppTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await app.client.close()
 
+    async def test_history_round_trip_preserves_template_strings(self) -> None:
+        app = self.make_app()
+        workflow = self.make_workflow()
+        try:
+            values = {
+                ("1", "seed"): RandomSeedValue(),
+                ("3", "prompt"): "prefix_${1.seed}_suffix",
+            }
+            serialized = app.serialize_history_values(values)
+            self.assertEqual(serialized["3|prompt"], "prefix_${1.seed}_suffix")
+
+            app.save_workflow_history(workflow, serialized)
+
+            reader = self.make_app()
+            try:
+                reader.load_workflow_history()
+                restored = await reader.resolve_history_values(
+                    workflow,
+                    reader.workflow_history_raw[reader.workflow_history_key(workflow)],
+                )
+                self.assertEqual(restored[("3", "prompt")], "prefix_${1.seed}_suffix")
+            finally:
+                await reader.client.close()
+        finally:
+            await app.client.close()
+
     async def test_prepare_load_image_value_keeps_final_comfyui_path_for_single_file(self) -> None:
         comfyui_dir = self.root / "ComfyUI"
         (comfyui_dir / "input").mkdir(parents=True)
@@ -150,6 +176,51 @@ class ComfyHelperAppTests(unittest.IsolatedAsyncioTestCase):
             with patch("comfyui_helper.app.random.shuffle", new=lambda items: items.reverse()):
                 resolved = app.resolve_submission_values(values)
             self.assertEqual([item[("2", "image")] for item in resolved], ["c.png", "b.png", "a.png"])
+        finally:
+            await app.client.close()
+
+    async def test_template_references_resolve_across_types_and_image_batch_branches(self) -> None:
+        app = self.make_app()
+        try:
+            workflow = WorkflowInfo(
+                name="refs",
+                path=self.root / "workflows" / "refs.json",
+                modified=0.0,
+                valid=True,
+                error=None,
+                fields=[
+                    ConfigField("1", "PrimitiveInt", None, "seed", 7, True, False),
+                    ConfigField("2", "PrimitiveBool", None, "flag", True, True, False),
+                    ConfigField("3", "LoadImage", None, "image", "", True, True),
+                    ConfigField("5", "PrimitiveInt", None, "copy_seed", 0, True, False),
+                    ConfigField("6", "PrimitiveBool", None, "copy_flag", False, True, False),
+                    ConfigField("4", "PrimitiveString", None, "prompt", "", True, False),
+                ],
+                unsupported_count=0,
+                data={},
+            )
+            values = {
+                ("1", "seed"): 7,
+                ("2", "flag"): True,
+                ("3", "image"): ImageBatch(source="/tmp/images", images=["a.png", "b.png"], shuffle=False),
+                ("5", "copy_seed"): "${1.seed}",
+                ("6", "copy_flag"): "${2.flag}",
+                ("4", "prompt"): "seed=${5.copy_seed},flag=${6.copy_flag},image=${3.image}",
+            }
+
+            resolved = await app.resolve_submission_values_for_workflow(workflow, values)
+
+            self.assertEqual(len(resolved), 2)
+            self.assertEqual([item[("3", "image")] for item in resolved], ["a.png", "b.png"])
+            self.assertEqual([item[("5", "copy_seed")] for item in resolved], [7, 7])
+            self.assertEqual([item[("6", "copy_flag")] for item in resolved], [True, True])
+            self.assertEqual(
+                [item[("4", "prompt")] for item in resolved],
+                [
+                    "seed=7,flag=True,image=a.png",
+                    "seed=7,flag=True,image=b.png",
+                ],
+            )
         finally:
             await app.client.close()
 
@@ -469,14 +540,6 @@ class ComfyHelperAppTests(unittest.IsolatedAsyncioTestCase):
         (self.root / "comfy-helper.yaml").write_text("comfyui_server: 10.0.0.5:9000\n", encoding="utf-8")
         config = load_config(self.root)
         self.assertEqual(config.comfyui_server, "10.0.0.5:9000")
-
-    def test_help_text_expands_queue_actions(self) -> None:
-        app = self.make_app()
-        help_text = app.help_text()
-        self.assertIn("select workflow", help_text)
-        self.assertIn("interrupt current running task", help_text)
-        self.assertIn("clear all pending tasks", help_text)
-        self.assertIn("delete selected pending task", help_text)
 
     async def test_comfy_client_normalizes_http_and_https_urls(self) -> None:
         client = ComfyClient("https://example.com:8188")

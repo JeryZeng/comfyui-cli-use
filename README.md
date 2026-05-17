@@ -41,12 +41,12 @@ comfyui_server: http://127.0.0.1:8188
 If `comfyui_server` is not set, the app uses `http://127.0.0.1:8188`.
 If you omit the scheme, the app assumes `http://` and derives the WebSocket URL from that scheme. If you set `https://`, the WebSocket URL follows as `wss://`.
 If `comfyui_dir` is set, `LoadImage` files are copied into `comfyui_dir/input` before submission.
-Directory inputs are expanded into one prompt per image file.
-When a directory contains multiple image files, the app asks whether to shuffle file order for that run. The choice is stored with the directory value and reused by `u` repeat and history restore.
-The upper area is split into a left interaction panel and a right read-only history panel on wide screens. The history panel shows the selected workflow's latest submitted field values. It is hidden on small screens.
+Directory inputs are expanded into one prompt per supported image file. Supported extensions are `.png`, `.jpg`, `.jpeg`, and `.webp`.
+When a directory contains multiple supported image files, the app asks whether to shuffle file order for that run. The choice is stored with the directory value and reused by `u` repeat and history restore.
+The upper area is split into a left interaction panel and a right read-only history panel on wide screens. The history panel shows the selected workflow's latest recorded submission values. Submission values are recorded before the HTTP request is sent, so they may reflect a failed submit attempt. The history panel is hidden on small screens.
 
 The app stores per-workflow history under `./data/workflow_history` as formatted JSON.
-Normal values are stored directly. `:seed` is saved as a random-seed marker, and `LoadImage` directory batches are saved as `image_batch` records with the original directory path and shuffle flag.
+Normal values are stored directly. `:seed` is saved as a random-seed marker. `LoadImage` directory batches are saved as `image_batch` records with the original directory path and shuffle flag. Template references are saved as the original template text, not as resolved values.
 
 ComfyUI is expected at:
 
@@ -78,25 +78,30 @@ Example:
 Rules:
 
 - Each item in `_meta.configurable` must match a key in that node's `inputs` object exactly.
-- A configurable field must be editable by the CLI. Supported field types are strings, integers, floats, and booleans.
+- Supported editable field types are strings, integers, floats, and booleans. Unsupported configured fields are counted and skipped during guided input.
 - `LoadImage.image` is a special case. It accepts a local file path or a directory path, and the CLI treats it as a path-based input instead of a plain string.
 - If a configured field name contains `path`, the CLI also enables path completion for it.
 - Fields not listed in `_meta.configurable` are ignored by guided input, even if they exist in the workflow JSON.
+- The app resolves fields in workflow dependency order before submission, so a field can reference another field even if that other field appears later in the guided input flow.
+- Template references use `${node_id.field_name}` syntax. A value can be a plain reference like `${117.value}` or a string with embedded references like `prefix_${117.value}_suffix`.
+- Integer, float, and boolean fields allow whole-field references and keep the referenced type.
+- String fields allow interpolation and coerce referenced values to text during substitution.
+- `LoadImage` values can reference other fields too. If a referenced `LoadImage` field is a directory batch, the reference resolves to the actual image path used by the current prompt branch.
 
 Effects in the TUI:
 
 - The guided input flow walks through configurable fields in workflow graph order.
 - Each configurable field can be edited individually from the keyboard.
-- The right-side history panel shows the last submitted value for each configurable field.
-- Saved workflow history also only tracks configurable fields.
+- The right-side history panel shows the last recorded submission value for each configurable field.
+- Saved workflow history tracks only configurable fields, and it preserves the original template text for template-based values.
 
 ## Basic Controls
 
 - `Enter`: run the selected workflow once.
 - `b`: run the selected workflow as a batch; after guided fields, enter the submit count.
-- `u`: repeat the last successful submission.
+- `u`: repeat the last recorded submission.
 - `Shift+Enter`: also attempts batch mode when the terminal reports it as a distinct key.
-- In integer fields, `:seed` requests a fresh random value on every submission.
+- In integer fields, `:seed` requests a fresh random value when submission values are resolved. With a directory `LoadImage` batch, fields resolved before the directory batch share one generated value across that directory expansion; fields resolved after the directory batch are resolved per expanded image prompt.
 - In field editing mode, `F2` fills the current field value back into the input box.
 - In field editing mode, `F7` clears the current input box content.
 - In field editing mode, `F3` goes to the previous editable field.
