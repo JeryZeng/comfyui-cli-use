@@ -1,2 +1,41 @@
+# comfyui-helper local config.
+# Copy this file to ./comfy-helper.yaml and adjust values for your machine.
+# ./comfy-helper.yaml is ignored by git.
+
+# Directory that contains ComfyUI API workflow JSON files.
+# Relative paths are resolved from the project working directory.
+workflow_dir: ./workflows
+
+# Queue/status refresh interval in seconds.
+# Float values are accepted. The runtime uses at least 0.1s internally.
+refresh_interval: 1.0
+
+# ComfyUI server URL.
+# Default: http://127.0.0.1:8188
+#
+# Supported forms:
+#   comfyui_server: http://127.0.0.1:8188
+#   comfyui_server: https://example.com:8188
+#   comfyui_server: 127.0.0.1:8188
+#   comfyui_server: ws://127.0.0.1:8188/ws
+#   comfyui_server: wss://example.com:8188/ws
+#
+# If the scheme is omitted, http:// is assumed.
+# http:// maps to ws:// for WebSocket.
+# https:// maps to wss:// for WebSocket.
 comfyui_server: http://127.0.0.1:8188
-comfyui_dir: /root/ComfyUI/
+
+# Optional local ComfyUI base directory.
+# When set, LoadImage files are copied directly into <comfyui_dir>/input
+# instead of using the ComfyUI upload API.
+#
+# Behavior:
+# - Files already under <comfyui_dir>/input are referenced by their relative path.
+# - External files are copied into <comfyui_dir>/input.
+# - Existing same-name files with the same size are reused.
+# - Existing same-name files with a different size are copied as name_1.ext,
+#   name_2.ext, and so on.
+# - Directory inputs are expanded into one prompt per supported image file.
+#
+# Leave this commented if the CLI cannot access the same filesystem as ComfyUI.
+# comfyui_dir: /root/ComfyUI
