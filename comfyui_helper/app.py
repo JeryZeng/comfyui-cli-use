@@ -40,6 +40,7 @@ MIN_HEIGHT = 24
 SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 FIXED_CLIENT_ID = "comfyui-helper"
 TERMINAL_TITLE = "comfy-cli-use"
+WORKFLOW_HISTORY_LIMIT = 10
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,13 @@ class LastSubmission:
     workflow_name: str
     values: dict[tuple[str, str], Any]
     count: int
+
+
+@dataclass(frozen=True)
+class WorkflowHistoryEntry:
+    saved_at: str
+    values: dict[str, Any]
+    hash: str
 
 
 class ComfyHelperApp(App[None]):
@@ -132,6 +140,8 @@ class ComfyHelperApp(App[None]):
         self.workflows: list[WorkflowInfo] = []
         self.workflow_index = 0
         self.pending_index = 0
+        self.history_index = 0
+        self.history_workflow_key: str | None = None
         self.focus_area = "top"
         self.mode = "browse"
         self.input_error: str | None = None
@@ -199,6 +209,15 @@ class ComfyHelperApp(App[None]):
         logging.info("Comfy Helper stopped")
 
     async def on_key(self, event: events.Key) -> None:
+        key = normalized_event_key(event)
+        logging.debug(
+            "key event key=%r character=%r normalized=%r mode=%s focus=%s",
+            getattr(event, "key", None),
+            getattr(event, "character", None),
+            key,
+            self.mode,
+            self.focus_area,
+        )
         if self.shuffle_prompt_message:
             await self.handle_shuffle_prompt_key(event)
             return
@@ -207,23 +226,23 @@ class ComfyHelperApp(App[None]):
             return
 
         if self.mode == "input":
-            if event.key == "f2" and self.is_param_input_focused():
+            if key == "f2" and self.is_param_input_focused():
                 self.fill_current_field_into_input()
                 event.stop()
                 return
-            if event.key == "f7" and self.is_param_input_focused():
+            if key == "f7" and self.is_param_input_focused():
                 self.clear_current_field_input()
                 event.stop()
                 return
-            if event.key == "f3" and self.is_param_input_focused():
+            if key == "f3" and self.is_param_input_focused():
                 await self.go_to_previous_field()
                 event.stop()
                 return
-            if event.key == "escape":
+            if key == "escape":
                 self.cancel_input()
                 event.stop()
                 return
-            elif event.key == "tab":
+            elif key == "tab":
                 self.complete_path()
                 event.stop()
             elif is_batch_key(event.key):
@@ -232,12 +251,43 @@ class ComfyHelperApp(App[None]):
             return
 
         if self.mode == "batch_count":
-            if event.key == "escape":
+            if key == "escape":
                 self.cancel_batch_count()
                 event.stop()
             return
 
-        key = event.key
+        if self.mode == "history":
+            if key in {"h", "escape"}:
+                self.exit_history_browse()
+                event.stop()
+                return
+            if key == "up":
+                self.move_history_selection(-1)
+                event.stop()
+                return
+            if key == "down":
+                self.move_history_selection(1)
+                event.stop()
+                return
+            if key == "enter":
+                await self.edit_selected_history()
+                event.stop()
+                return
+            if key == "u":
+                await self.submit_selected_history()
+                event.stop()
+                return
+            if key == "b":
+                await self.batch_selected_history()
+                event.stop()
+                return
+            if key == "q":
+                await self.request_quit()
+                event.stop()
+                return
+            event.stop()
+            return
+
         if key == "q":
             await self.request_quit()
             event.stop()
@@ -271,6 +321,10 @@ class ComfyHelperApp(App[None]):
             return
         if key == "u":
             await self.action_repeat_last_submission()
+            event.stop()
+            return
+        if key == "h":
+            await self.start_history_browse()
             event.stop()
             return
         if key == "tab":
@@ -338,6 +392,104 @@ class ComfyHelperApp(App[None]):
             count=last.count,
         )
 
+    async def action_history(self) -> None:
+        if self.mode == "history":
+            self.exit_history_browse()
+            return
+        await self.start_history_browse()
+
+    def selected_workflow_history_entries(self) -> list[WorkflowHistoryEntry]:
+        workflow = self.selected_workflow
+        if workflow is None:
+            return []
+        raw_history = self.workflow_history_raw.get(self.workflow_history_key(workflow), {})
+        return self.workflow_history_entries(raw_history)
+
+    def displayed_history_entries(self) -> list[WorkflowHistoryEntry]:
+        return list(reversed(self.selected_workflow_history_entries()))
+
+    def selected_history_entry(self) -> WorkflowHistoryEntry | None:
+        entries = self.displayed_history_entries()
+        if not entries:
+            return None
+        self.history_index = max(0, min(self.history_index, len(entries) - 1))
+        return entries[self.history_index]
+
+    async def start_history_browse(self) -> None:
+        workflow = self.selected_workflow
+        if workflow is None:
+            self.add_message("No workflow selected.")
+            self.render_all()
+            return
+        entries = self.selected_workflow_history_entries()
+        if not entries:
+            self.add_message("No history for selected workflow.")
+            self.render_all()
+            return
+        self.mode = "history"
+        self.focus_area = "top"
+        self.history_workflow_key = self.workflow_history_key(workflow)
+        self.history_index = 0
+        self.render_all()
+
+    def exit_history_browse(self) -> None:
+        self.mode = "browse"
+        self.history_index = 0
+        self.history_workflow_key = None
+        self.render_all()
+
+    def move_history_selection(self, delta: int) -> None:
+        entries = self.displayed_history_entries()
+        if entries:
+            self.history_index = max(0, min(self.history_index + delta, len(entries) - 1))
+        self.render_all()
+
+    async def history_entry_values(
+            self,
+            workflow: WorkflowInfo,
+            entry: WorkflowHistoryEntry,
+    ) -> dict[tuple[str, str], Any]:
+        return await self.resolve_history_entry_values(workflow, entry.values)
+
+    async def edit_selected_history(self) -> None:
+        workflow = self.selected_workflow
+        entry = self.selected_history_entry()
+        if workflow is None or entry is None:
+            return
+        values = await self.history_entry_values(workflow, entry)
+        self.mode = "input"
+        self.active_workflow = workflow
+        self.active_field_index = 0
+        self.active_values = values
+        self.batch_after_input = False
+        self.input_error = None
+        self.clear_completion()
+        self.show_input_for_current_field()
+
+    async def submit_selected_history(self) -> None:
+        workflow = self.selected_workflow
+        entry = self.selected_history_entry()
+        if workflow is None or entry is None:
+            return
+        if self.runtime.online is not True:
+            self.add_message("ComfyUI is offline; cannot submit history.")
+            self.render_all()
+            return
+        values = await self.history_entry_values(workflow, entry)
+        self.mode = "browse"
+        self.history_workflow_key = None
+        await self.submit_workflow(workflow, values, count=1)
+
+    async def batch_selected_history(self) -> None:
+        workflow = self.selected_workflow
+        entry = self.selected_history_entry()
+        if workflow is None or entry is None:
+            return
+        values = await self.history_entry_values(workflow, entry)
+        self.mode = "browse"
+        self.history_workflow_key = None
+        self.show_batch_count_input(workflow, values)
+
     async def action_clear_pending(self) -> None:
         if not self.runtime.pending:
             self.add_message("No pending tasks to clear.")
@@ -382,7 +534,8 @@ class ComfyHelperApp(App[None]):
             raw_history = self.workflow_history_raw.get(workflow_key)
             if raw_history is None:
                 continue
-            values = raw_history.get("values", {})
+            entry = self.latest_history_entry(raw_history)
+            values = entry.values if entry is not None else {}
             if not isinstance(values, dict) or not values:
                 continue
             refreshed[workflow_key] = LastSubmission(
@@ -413,8 +566,7 @@ class ComfyHelperApp(App[None]):
             if not isinstance(data, dict):
                 continue
             workflow_path = data.get("workflow_path")
-            values = data.get("values")
-            if not isinstance(workflow_path, str) or not isinstance(values, dict):
+            if not isinstance(workflow_path, str):
                 continue
             self.workflow_history_raw[workflow_path] = data
 
@@ -438,7 +590,15 @@ class ComfyHelperApp(App[None]):
             workflow: WorkflowInfo,
             raw_history: dict[str, Any],
     ) -> dict[tuple[str, str], Any]:
-        values = raw_history.get("values", {})
+        entry = self.latest_history_entry(raw_history)
+        values = entry.values if entry is not None else {}
+        return await self.resolve_history_entry_values(workflow, values)
+
+    async def resolve_history_entry_values(
+            self,
+            workflow: WorkflowInfo,
+            values: dict[str, Any],
+    ) -> dict[tuple[str, str], Any]:
         if not isinstance(values, dict):
             return {}
 
@@ -504,17 +664,90 @@ class ComfyHelperApp(App[None]):
 
     def save_workflow_history(self, workflow: WorkflowInfo, serialized_values: dict[str, Any]) -> None:
         self.workflow_history_dir.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "workflow_path": self.workflow_history_key(workflow),
-            "workflow_name": workflow.name,
-            "saved_at": datetime.now().isoformat(timespec="seconds"),
-            "values": serialized_values,
-        }
+        workflow_key = self.workflow_history_key(workflow)
+        now = datetime.now().isoformat(timespec="seconds")
+        value_hash = self.hash_history_values(serialized_values)
+        raw_history = self.workflow_history_raw.get(workflow_key)
         history_path = self.workflow_history_path(workflow)
+        if raw_history is None and history_path.exists():
+            try:
+                loaded = json.loads(history_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    raw_history = loaded
+            except Exception:
+                logging.exception("Failed to read existing workflow history %s", history_path)
+        entries = self.workflow_history_entries(raw_history or {})
+        entries = [entry for entry in entries if entry.hash != value_hash]
+        entries.append(
+            WorkflowHistoryEntry(
+                saved_at=now,
+                values=copy.deepcopy(serialized_values),
+                hash=value_hash,
+            )
+        )
+        entries = entries[-WORKFLOW_HISTORY_LIMIT:]
+        payload = {
+            "workflow_path": workflow_key,
+            "workflow_name": workflow.name,
+            "history": [
+                {
+                    "saved_at": entry.saved_at,
+                    "hash": entry.hash,
+                    "values": entry.values,
+                }
+                for entry in entries
+            ],
+        }
         history_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        self.workflow_history_raw[workflow_key] = payload
+
+    def workflow_history_entries(self, raw_history: dict[str, Any]) -> list[WorkflowHistoryEntry]:
+        entries: list[WorkflowHistoryEntry] = []
+        raw_entries = raw_history.get("history")
+        if isinstance(raw_entries, list):
+            for item in raw_entries:
+                if not isinstance(item, dict):
+                    continue
+                values = item.get("values")
+                if not isinstance(values, dict):
+                    continue
+                saved_at = item.get("saved_at")
+                if not isinstance(saved_at, str) or not saved_at:
+                    saved_at = raw_history.get("saved_at") if isinstance(raw_history.get("saved_at"), str) else ""
+                value_hash = item.get("hash")
+                if not isinstance(value_hash, str) or not value_hash:
+                    value_hash = self.hash_history_values(values)
+                entries.append(
+                    WorkflowHistoryEntry(
+                        saved_at=saved_at,
+                        values=copy.deepcopy(values),
+                        hash=value_hash,
+                    )
+                )
+        elif isinstance(raw_history.get("values"), dict):
+            values = raw_history["values"]
+            saved_at = raw_history.get("saved_at")
+            entries.append(
+                WorkflowHistoryEntry(
+                    saved_at=saved_at if isinstance(saved_at, str) else "",
+                    values=copy.deepcopy(values),
+                    hash=self.hash_history_values(values),
+                )
+            )
+        return entries[-WORKFLOW_HISTORY_LIMIT:]
+
+    def latest_history_entry(self, raw_history: dict[str, Any]) -> WorkflowHistoryEntry | None:
+        entries = self.workflow_history_entries(raw_history)
+        if not entries:
+            return None
+        return entries[-1]
+
+    def hash_history_values(self, values: dict[str, Any]) -> str:
+        canonical = json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.md5(canonical.encode("utf-8")).hexdigest()
 
     def workflow_history_path(self, workflow: WorkflowInfo) -> Path:
         workflow_key = self.workflow_history_key(workflow)
@@ -1666,19 +1899,20 @@ class ComfyHelperApp(App[None]):
         top_left_content = self.query_one("#top_left_content", Static)
         top_right = self.query_one("#top_right", Static)
         compact = self.is_compact_layout()
-        if compact:
-            top.styles.width = "100%"
-            top_left_container.styles.width = "100%"
-            top_left_container.styles.padding_right = 0
-            top_right.add_class("hidden")
-        else:
+        show_history_detail = self.mode == "history" and not compact
+        if show_history_detail:
             top.styles.width = "100%"
             top_left_container.styles.width = "70%"
             top_left_container.styles.padding_right = 1
             top_right.styles.width = "30%"
             top_right.remove_class("hidden")
+            top_right.update(self.render_history_detail())
+        else:
+            top.styles.width = "100%"
+            top_left_container.styles.width = "100%"
+            top_left_container.styles.padding_right = 0
+            top_right.add_class("hidden")
         top_left_content.update(self.render_top())
-        top_right.update(self.render_workflow_history_panel())
         self.query_one("#bottom", Static).update(self.render_bottom())
 
     def render_top(self) -> str:
@@ -1701,6 +1935,8 @@ class ComfyHelperApp(App[None]):
             return self.render_input(compact=compact)
         if self.mode == "batch_count":
             return self.render_batch_count(compact=compact)
+        if self.mode == "history":
+            return self.render_history_browser(compact=compact)
         return self.render_browser(compact=compact)
 
     def render_workflow_history_panel(self) -> str:
@@ -1738,6 +1974,103 @@ class ComfyHelperApp(App[None]):
             if index < len(items) - 1:
                 lines.append("----------")
         return "\n".join(lines)
+
+    def render_history_browser(self, compact: bool = False) -> str:
+        workflow = self.selected_workflow
+        if workflow is None:
+            return "[bold cyan]History Browse[/]\n\nNo workflow selected."
+        entries = self.displayed_history_entries()
+        lines = ["[bold cyan]History Browse[/]", f"Workflow: {escape(workflow.name)}", ""]
+        if not entries:
+            lines.append("No history for selected workflow.")
+            lines.append("Press h or Esc to return.")
+            return "\n".join(lines)
+
+        self.history_index = max(0, min(self.history_index, len(entries) - 1))
+        lines.append(f"History records: {len(entries)}/{WORKFLOW_HISTORY_LIMIT}")
+        lines.append("↑↓ select | Enter edit | u submit | b batch | h/Esc back")
+        lines.append("")
+        height_budget = 8 if compact else max(8, self.size.height // 3)
+        start = max(0, min(self.history_index - height_budget // 2, len(entries) - height_budget))
+        end = min(len(entries), start + height_budget)
+        for display_index, entry in enumerate(entries[start:end], start=start):
+            marker = ">" if display_index == self.history_index else " "
+            row = (
+                f"{marker} {escape(short_time(entry.saved_at))} "
+                f"{escape(entry.hash[:6])} "
+                f"{escape(self.history_entry_summary(entry))}"
+            )
+            if display_index == self.history_index:
+                row = f"[reverse bold]{row}[/]"
+            lines.append(row)
+
+        if compact:
+            lines.append("")
+            lines.append("[bold]Selected[/]")
+            lines.extend(self.render_history_entry_fields(workflow, entries[self.history_index], max_fields=6))
+        return "\n".join(lines)
+
+    def render_history_detail(self) -> str:
+        workflow = self.selected_workflow
+        entry = self.selected_history_entry()
+        if workflow is None:
+            return "[bold cyan]History Detail[/]\n\nNo workflow selected."
+        if entry is None:
+            return "[bold cyan]History Detail[/]\n\nNo history selected."
+        lines = [
+            "[bold cyan]History Detail[/]",
+            "",
+            f"Workflow: {escape(workflow.name)}",
+            f"Saved: {escape(entry.saved_at or '-')}",
+            f"Hash: {escape(entry.hash)}",
+            "",
+        ]
+        lines.extend(self.render_history_entry_fields(workflow, entry))
+        return "\n".join(lines)
+
+    def render_history_entry_fields(
+            self,
+            workflow: WorkflowInfo,
+            entry: WorkflowHistoryEntry,
+            max_fields: int | None = None,
+    ) -> list[str]:
+        lines: list[str] = []
+        field_map = {(field.node_id, field.name): field for field in workflow.fields}
+        field_order = {field_key: index for index, field_key in enumerate((field.node_id, field.name) for field in workflow.fields)}
+        items = sorted(
+            entry.values.items(),
+            key=lambda item: (
+                field_order.get(self.deserialize_field_key(item[0]) or ("", ""), len(workflow.fields)),
+                item[0],
+            ),
+        )
+        if max_fields is not None:
+            items = items[:max_fields]
+        for index, (key_text, value) in enumerate(items):
+            field_key = self.deserialize_field_key(key_text)
+            if field_key is None:
+                continue
+            field = field_map.get(field_key)
+            field_label = field.display_name if field is not None else f"{field_key[0]}/{field_key[1]}"
+            lines.append(f"{escape(field_key[0])}/{escape(field_key[1])}")
+            lines.append(f"{escape(field_label)}")
+            lines.append(escape(format_history_value(value)))
+            if index < len(items) - 1:
+                lines.append("----------")
+        return lines
+
+    def history_entry_summary(self, entry: WorkflowHistoryEntry) -> str:
+        preferred_names = ("prompt", "filename_prefix", "image")
+        for preferred in preferred_names:
+            for key_text, value in entry.values.items():
+                field_key = self.deserialize_field_key(key_text)
+                if field_key is not None and field_key[1].split(".")[-1] == preferred:
+                    return f"{preferred}: {truncate_text(format_history_value(value), 48)}"
+        for key_text, value in entry.values.items():
+            field_key = self.deserialize_field_key(key_text)
+            label = field_key[1] if field_key is not None else key_text
+            return f"{label}: {truncate_text(format_history_value(value), 48)}"
+        return "(empty)"
 
     def render_browser(self, compact: bool = False) -> str:
         lines = ["[bold cyan]Workflow Runner[/]" if self.focus_area == "top" else "[bold]Workflow Runner[/]"]
@@ -1989,7 +2322,9 @@ class ComfyHelperApp(App[None]):
             return "Enter next | F2 fill current | F7 clear input | F3 previous | b/:batch batch | :seed random | :run submit | Tab complete | Esc cancel"
         if self.mode == "batch_count":
             return "Enter submit batch | positive integer only | Esc cancel"
-        return "↑↓ sel | Enter run | b batch | u repeat | Tab | r reload | s refresh | i interrupt | d delete pending | c clear queue | q quit"
+        if self.mode == "history":
+            return "↑↓ select history | Enter edit | u submit | b batch | h/Esc back | q quit"
+        return "↑↓ sel | Enter run | b batch | u repeat | h history | Tab | r reload | s refresh | i interrupt | d delete pending | c clear queue | q quit"
 
     def clear_completion(self) -> None:
         self.completion_matches = []
@@ -2001,8 +2336,29 @@ def short_error(exc: Exception) -> str:
     return text if len(text) <= 160 else text[:157] + "..."
 
 
+def normalized_event_key(event: events.Key) -> str:
+    key = getattr(event, "key", "") or ""
+    if key:
+        return key.lower()
+    character = getattr(event, "character", "") or ""
+    return character.lower()
+
+
 def short_id(prompt_id: str) -> str:
     return escape(prompt_id[:8] if prompt_id and prompt_id != "?" else prompt_id)
+
+
+def short_time(value: str) -> str:
+    if "T" in value:
+        date, time = value.split("T", 1)
+        return f"{date} {time[:5]}"
+    return value[:16] if value else "-"
+
+
+def truncate_text(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 3)] + "..."
 
 
 def color_count(value: int, color: str) -> str:

@@ -72,7 +72,13 @@ Rules:
 
 Workflow history:
 
-- Per-workflow last values are stored under `./data/workflow_history`.
+- Per-workflow values are stored under `./data/workflow_history`.
+- Each workflow history file stores a `history` array.
+- Each history entry contains `saved_at`, `hash`, and `values`.
+- History entries are ordered from oldest to newest.
+- The latest values are read from the last history entry.
+- At most 10 entries are retained per workflow.
+- If a submitted value set has the same MD5 hash as an existing entry, the old entry is moved to the newest position instead of duplicated.
 - History files are formatted JSON.
 - Normal values are stored directly.
 - `:seed` is stored as a random-seed marker.
@@ -259,10 +265,11 @@ The upper region switches content:
 
 - Workflow browsing state.
 - Guided parameter input state.
+- History browsing state.
 
 The lower region remains visible and continues refreshing during parameter input without disturbing input focus or current typed text.
 
-If the terminal is small, the app switches to a compact layout and hides the right-side history panel.
+The default browser/input layout uses a single upper interaction panel.
 
 ## Workflow Browsing State
 
@@ -288,6 +295,40 @@ If refreshing the workflow list:
 - Try to preserve current selection.
 - If current workflow no longer exists, select the first item.
 
+## History Browsing State
+
+Start:
+
+- Select a workflow.
+- Press `h`.
+- If the workflow has no history, stay in workflow browsing state and show a message.
+- If the workflow has history, enter history browsing state.
+
+Display:
+
+- Left area: history list for the selected workflow.
+- Right area on wide screens: selected history record detail.
+- On small screens, only the history list is shown.
+- History list is displayed from newest to oldest.
+- The selected record is highlighted.
+
+History list row:
+
+- selected marker
+- saved time
+- first 6 characters of the entry hash
+- summary text, preferring prompt, filename prefix, image, then the first available field
+
+Controls:
+
+- `h`: exit history browsing state.
+- `Esc`: exit history browsing state.
+- `Up/Down`: select history record.
+- `Enter`: enter guided input using the selected history values.
+- `u`: submit the selected history once.
+- `b`: start batch submit from the selected history values.
+- `q`: global quit confirmation.
+
 ## Guided Parameter Input
 
 Start:
@@ -307,12 +348,6 @@ Current value: a cat
 Input new value, Enter keeps current, F2 fills current value, F7 clears input, F3 previous, :run submits now, Esc cancels:
 >
 ```
-
-Top layout on wide screens:
-
-- Left panel: workflow browser or guided input.
-- Right panel: read-only last submission history for the selected workflow.
-- On small screens, the right panel is hidden and the left panel uses the full width.
 
 Node label:
 

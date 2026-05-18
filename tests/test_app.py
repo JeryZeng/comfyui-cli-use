@@ -85,6 +85,10 @@ class ComfyHelperAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(serialized["3|prompt"], "hello")
 
             app.save_workflow_history(workflow, serialized)
+            raw_payload = app.workflow_history_raw[app.workflow_history_key(workflow)]
+            self.assertNotIn("values", raw_payload)
+            self.assertEqual(len(raw_payload["history"]), 1)
+            self.assertEqual(raw_payload["history"][0]["values"], serialized)
 
             reader = self.make_app(comfyui_dir=comfyui_dir)
             try:
@@ -103,6 +107,45 @@ class ComfyHelperAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(restored_batch.shuffle)
             finally:
                 await reader.client.close()
+        finally:
+            await app.client.close()
+
+    async def test_old_single_value_history_format_still_restores(self) -> None:
+        app = self.make_app()
+        workflow = self.make_workflow()
+        try:
+            raw_history = {
+                "workflow_path": app.workflow_history_key(workflow),
+                "workflow_name": workflow.name,
+                "saved_at": "2026-05-18T12:00:00",
+                "values": {
+                    "1|seed": {"type": "random_seed"},
+                    "3|prompt": "legacy",
+                },
+            }
+
+            restored = await app.resolve_history_values(workflow, raw_history)
+
+            self.assertIsInstance(restored[("1", "seed")], RandomSeedValue)
+            self.assertEqual(restored[("3", "prompt")], "legacy")
+        finally:
+            await app.client.close()
+
+    async def test_workflow_history_deduplicates_moves_to_latest_and_limits_to_ten(self) -> None:
+        app = self.make_app()
+        workflow = self.make_workflow()
+        try:
+            for index in range(11):
+                app.save_workflow_history(workflow, {"3|prompt": f"prompt {index}"})
+            app.save_workflow_history(workflow, {"3|prompt": "prompt 5"})
+
+            raw_payload = app.workflow_history_raw[app.workflow_history_key(workflow)]
+            history = raw_payload["history"]
+
+            self.assertEqual(len(history), 10)
+            self.assertEqual(history[-1]["values"], {"3|prompt": "prompt 5"})
+            self.assertEqual(len({entry["hash"] for entry in history}), 10)
+            self.assertNotIn({"3|prompt": "prompt 0"}, [entry["values"] for entry in history])
         finally:
             await app.client.close()
 
@@ -445,6 +488,81 @@ class ComfyHelperAppTests(unittest.IsolatedAsyncioTestCase):
         app.workflows = [workflow]
         panel = app.render_workflow_history_panel()
         self.assertIn("No submission history yet.", panel)
+
+    async def test_history_browse_renders_records_and_enters_edit_with_selected_values(self) -> None:
+        app = self.make_app()
+        try:
+            workflow = self.make_workflow()
+            app.workflows = [workflow]
+            app.workflow_index = 0
+            app.runtime.online = True
+            app.save_workflow_history(workflow, {"3|prompt": "older"})
+            app.save_workflow_history(workflow, {"3|prompt": "newer"})
+
+            with patch.object(app, "render_all"):
+                await app.start_history_browse()
+            rendered = app.render_history_browser()
+
+            self.assertEqual(app.mode, "history")
+            self.assertIn("History Browse", rendered)
+            self.assertIn("newer", rendered)
+            self.assertIn("older", rendered)
+
+            class FakeInput:
+                def __init__(self) -> None:
+                    self.value = ""
+                    self.cursor_position = 0
+                    self.placeholder = ""
+                    self.can_focus = False
+
+                def remove_class(self, _name: str) -> None:
+                    pass
+
+                def focus(self) -> None:
+                    pass
+
+            fake_input = FakeInput()
+            with patch.object(app, "query_one", return_value=fake_input), patch.object(app, "render_all"):
+                await app.edit_selected_history()
+
+            self.assertEqual(app.mode, "input")
+            self.assertEqual(app.active_values[("3", "prompt")], "newer")
+        finally:
+            await app.client.close()
+
+    async def test_h_key_enters_and_exits_history_browse(self) -> None:
+        app = self.make_app()
+        try:
+            workflow = self.make_workflow()
+            app.workflows = [workflow]
+            app.workflow_index = 0
+            app.save_workflow_history(workflow, {"3|prompt": "newer"})
+
+            class FakeKey:
+                def __init__(self, key: str, character: str | None = None) -> None:
+                    self.key = key
+                    self.character = character
+                    self.stopped = False
+
+                def stop(self) -> None:
+                    self.stopped = True
+
+            with patch.object(app, "render_all"):
+                enter_event = FakeKey("H", "H")
+                await app.on_key(enter_event)
+                self.assertTrue(enter_event.stopped)
+                self.assertEqual(app.mode, "history")
+
+                exit_event = FakeKey("h", "h")
+                await app.on_key(exit_event)
+                self.assertTrue(exit_event.stopped)
+                self.assertEqual(app.mode, "browse")
+        finally:
+            await app.client.close()
+
+    def test_h_key_is_handled_only_by_on_key(self) -> None:
+        bound_keys = {binding[0] for binding in ComfyHelperApp.BINDINGS}
+        self.assertNotIn("h", bound_keys)
 
     def test_validate_workflow_orders_fields_by_topology_not_node_id(self) -> None:
         workflow = validate_workflow(

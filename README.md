@@ -43,10 +43,10 @@ If you omit the scheme, the app assumes `http://` and derives the WebSocket URL 
 If `comfyui_dir` is set, `LoadImage` files are copied into `comfyui_dir/input` before submission.
 Directory inputs are expanded into one prompt per supported image file. Supported extensions are `.png`, `.jpg`, `.jpeg`, and `.webp`.
 When a directory contains multiple supported image files, the app asks whether to shuffle file order for that run. The choice is stored with the directory value and reused by `u` repeat and history restore.
-The upper area is split into a left interaction panel and a right read-only history panel on wide screens. The history panel shows the selected workflow's latest recorded submission values. Submission values are recorded before the HTTP request is sent, so they may reflect a failed submit attempt. The history panel is hidden on small screens.
+The default upper area is a single interaction panel for workflow selection and guided input. Press `h` on a selected workflow to enter history browse mode.
 
 The app stores per-workflow history under `./data/workflow_history` as formatted JSON.
-Normal values are stored directly. `:seed` is saved as a random-seed marker. `LoadImage` directory batches are saved as `image_batch` records with the original directory path and shuffle flag. Template references are saved as the original template text, not as resolved values.
+Each workflow keeps up to 10 history records. Reusing an existing record moves it to the newest position instead of duplicating it. Normal values are stored directly. `:seed` is saved as a random-seed marker. `LoadImage` directory batches are saved as `image_batch` records with the original directory path and shuffle flag. Template references are saved as the original template text, not as resolved values.
 
 ComfyUI is expected at:
 
@@ -98,7 +98,7 @@ Effects in the TUI:
 - The guided input flow walks through configurable fields in workflow graph order.
 - Each configurable field can be edited individually from the keyboard.
 - Nested fields are written back to only that path, so sibling values in the same object are preserved.
-- The right-side history panel shows the last recorded submission value for each configurable field.
+- History browse mode shows saved records for the selected workflow and lets you reuse one for editing, single submit, or batch submit.
 - Saved workflow history tracks only configurable fields, and it preserves the original template text for template-based values.
 
 ## Basic Controls
@@ -106,6 +106,8 @@ Effects in the TUI:
 - `Enter`: run the selected workflow once.
 - `b`: run the selected workflow as a batch; after guided fields, enter the submit count.
 - `u`: repeat the last recorded submission.
+- `h`: enter or exit history browse for the selected workflow.
+- In history browse, `↑/↓` selects a record, `Enter` edits from that record, `u` submits it once, and `b` starts batch submit from it.
 - `Shift+Enter`: also attempts batch mode when the terminal reports it as a distinct key.
 - In integer fields, `:seed` requests a fresh random value when submission values are resolved. With a directory `LoadImage` batch, fields resolved before the directory batch share one generated value across that directory expansion; fields resolved after the directory batch are resolved per expanded image prompt.
 - In field editing mode, `F2` fills the current field value back into the input box.
