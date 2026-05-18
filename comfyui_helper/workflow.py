@@ -130,14 +130,14 @@ def validate_workflow(
                 logging.warning("Duplicate configurable field ignored: %s %s", node_id, field_name)
                 continue
             seen.add(field_name)
-            if field_name not in node["inputs"]:
+            value = get_input_path_value(node["inputs"], field_name)
+            if value is _MISSING:
                 return _invalid(
                     name,
                     path,
                     modified,
                     f'Configurable field "{field_name}" not found in node "{node_id}".inputs.',
                 )
-            value = node["inputs"][field_name]
             is_load_image = class_type == "LoadImage" and field_name == "image"
             supported = isinstance(value, SUPPORTED_TYPES) or is_load_image
             if not supported:
@@ -212,10 +212,46 @@ def output_driven_node_order(data: dict[str, Any]) -> list[str]:
     return ordered
 
 
+_MISSING = object()
+
+
+def split_input_path(field_name: str) -> list[str] | None:
+    parts = field_name.split(".")
+    if not parts or any(not part for part in parts):
+        return None
+    return parts
+
+
+def get_input_path_value(inputs: dict[str, Any], field_name: str) -> Any:
+    parts = split_input_path(field_name)
+    if parts is None:
+        return _MISSING
+    current: Any = inputs
+    for part in parts:
+        if not isinstance(current, dict) or part not in current:
+            return _MISSING
+        current = current[part]
+    return current
+
+
+def set_input_path_value(inputs: dict[str, Any], field_name: str, value: Any) -> None:
+    parts = split_input_path(field_name)
+    if parts is None:
+        raise KeyError(field_name)
+    current: Any = inputs
+    for part in parts[:-1]:
+        if not isinstance(current, dict) or part not in current:
+            raise KeyError(field_name)
+        current = current[part]
+    if not isinstance(current, dict) or parts[-1] not in current:
+        raise KeyError(field_name)
+    current[parts[-1]] = value
+
+
 def apply_field_values(workflow: dict[str, Any], values: dict[tuple[str, str], Any]) -> dict[str, Any]:
     updated = copy.deepcopy(workflow)
     for (node_id, field_name), value in values.items():
-        updated[node_id]["inputs"][field_name] = value
+        set_input_path_value(updated[node_id]["inputs"], field_name, value)
     return updated
 
 

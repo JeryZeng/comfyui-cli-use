@@ -193,7 +193,9 @@ Rules:
 - `_meta.configurable` may be an empty array.
 - If present, `_meta.configurable` must be an array.
 - All array elements must be strings.
-- Each configurable field must exist in that node's `inputs`.
+- Each configurable field must exist as a field path under that node's `inputs`.
+- Nested object fields use dot paths, such as `lora_2.strength` for `inputs.lora_2.strength`.
+- Array indexes are not supported in configurable field paths.
 - Duplicate fields in the same node are deduplicated, preserving the first occurrence.
 - Same field names across different nodes are allowed.
 - Configurable field order follows workflow graph dependency order, with each node's `_meta.configurable` array order preserved within that node.
@@ -207,14 +209,14 @@ Supported editable value types:
 - float
 - bool
 
-Unsupported first-version editable types:
+Unsupported editable types:
 
 - list
 - dict
 - null
 - other complex values
 
-Unsupported configured fields do not make the workflow invalid. During guided input, the tool reports that the field cannot be edited and keeps the original value.
+Unsupported configured field values do not make the workflow invalid. During guided input, the tool reports that the field cannot be edited and keeps the original value.
 
 ## LoadImage File Input
 

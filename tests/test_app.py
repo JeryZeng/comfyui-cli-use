@@ -13,7 +13,7 @@ from comfyui_helper.app import ComfyHelperApp, ImageBatch, LastSubmission, Rando
 from comfyui_helper.client import ComfyClient
 from comfyui_helper.config import DEFAULT_COMFYUI_SERVER, load_config
 from comfyui_helper.state import QueueItem, RecentItem
-from comfyui_helper.workflow import ConfigField, WorkflowInfo, validate_workflow
+from comfyui_helper.workflow import ConfigField, WorkflowInfo, apply_field_values, validate_workflow
 
 
 class ComfyHelperAppTests(unittest.IsolatedAsyncioTestCase):
@@ -254,6 +254,33 @@ class ComfyHelperAppTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await app.client.close()
 
+    async def test_template_references_support_nested_field_paths(self) -> None:
+        app = self.make_app()
+        try:
+            workflow = WorkflowInfo(
+                name="refs",
+                path=self.root / "workflows" / "refs.json",
+                modified=0.0,
+                valid=True,
+                error=None,
+                fields=[
+                    ConfigField("10", "PowerLoraLoader", None, "lora_2.strength", 0.7, True, False),
+                    ConfigField("11", "PrimitiveString", None, "prompt", "", True, False),
+                ],
+                unsupported_count=0,
+                data={},
+            )
+            values = {
+                ("10", "lora_2.strength"): 0.9,
+                ("11", "prompt"): "strength=${10.lora_2.strength}",
+            }
+
+            resolved = await app.resolve_submission_values_for_workflow(workflow, values)
+
+            self.assertEqual(resolved[0][("11", "prompt")], "strength=0.9")
+        finally:
+            await app.client.close()
+
     def test_format_field_value_shows_image_batch_shuffle_state(self) -> None:
         value = ImageBatch(source="/tmp/images", images=["a.png", "b.png"], shuffle=True)
         self.assertEqual(format_field_value(value), "2 images from /tmp/images (shuffled)")
@@ -485,6 +512,65 @@ class ComfyHelperAppTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(workflow.valid)
         self.assertEqual([field.node_id for field in workflow.fields], ["10", "30", "11", "20"])
+
+    def test_validate_workflow_supports_nested_configurable_field_paths(self) -> None:
+        workflow = validate_workflow(
+            "demo",
+            self.root / "workflows" / "demo.json",
+            0.0,
+            {
+                "10": {
+                    "inputs": {
+                        "lora_2": {
+                            "on": False,
+                            "lora": "qwen_2512.safetensors",
+                            "strength": 0.7,
+                        },
+                    },
+                    "class_type": "PowerLoraLoader",
+                    "_meta": {
+                        "title": "Lora",
+                        "configurable": ["lora_2.on", "lora_2.lora", "lora_2.strength"],
+                    },
+                },
+            },
+        )
+
+        self.assertTrue(workflow.valid)
+        self.assertEqual([field.name for field in workflow.fields], ["lora_2.on", "lora_2.lora", "lora_2.strength"])
+        self.assertEqual([field.value for field in workflow.fields], [False, "qwen_2512.safetensors", 0.7])
+        self.assertEqual([field.supported for field in workflow.fields], [True, True, True])
+
+    def test_apply_field_values_updates_nested_path_without_replacing_parent_object(self) -> None:
+        workflow = {
+            "10": {
+                "inputs": {
+                    "lora_2": {
+                        "on": False,
+                        "lora": "old.safetensors",
+                        "strength": 0.7,
+                    },
+                },
+            },
+        }
+
+        updated = apply_field_values(
+            workflow,
+            {
+                ("10", "lora_2.on"): True,
+                ("10", "lora_2.strength"): 0.9,
+            },
+        )
+
+        self.assertEqual(
+            updated["10"]["inputs"]["lora_2"],
+            {
+                "on": True,
+                "lora": "old.safetensors",
+                "strength": 0.9,
+            },
+        )
+        self.assertFalse(workflow["10"]["inputs"]["lora_2"]["on"])
 
     def test_render_all_compact_layout_expands_left_panel(self) -> None:
         app = self.make_app()

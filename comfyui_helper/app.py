@@ -10,6 +10,7 @@ import os
 import random
 import secrets
 import shutil
+import sys
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -38,6 +39,7 @@ MIN_WIDTH = 78
 MIN_HEIGHT = 24
 SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 FIXED_CLIENT_ID = "comfyui-helper"
+TERMINAL_TITLE = "comfy-cli-use"
 
 
 @dataclass(frozen=True)
@@ -159,6 +161,7 @@ class ComfyHelperApp(App[None]):
         self.last_submission: LastSubmission | None = None
         self._tasks: list[asyncio.Task[Any]] = []
         self.spinner_index = 0
+        self.current_terminal_title: str | None = None
         self.completion_matches: list[str] = []
         self.completion_prefix: str | None = None
 
@@ -181,6 +184,7 @@ class ComfyHelperApp(App[None]):
             self.add_message(message)
         self.reload_workflows()
         await self.refresh_workflow_history_cache()
+        self.update_terminal_title()
         self.render_all()
         self._tasks.append(asyncio.create_task(self.poll_loop()))
         self._tasks.append(asyncio.create_task(self.websocket_loop()))
@@ -190,6 +194,7 @@ class ComfyHelperApp(App[None]):
     async def on_unmount(self) -> None:
         for task in self._tasks:
             task.cancel()
+        self.set_terminal_title(TERMINAL_TITLE)
         await self.client.close()
         logging.info("Comfy Helper stopped")
 
@@ -1420,6 +1425,7 @@ class ComfyHelperApp(App[None]):
             try:
                 if self.runtime.running:
                     self.spinner_index = (self.spinner_index + 1) % len(SPINNER_FRAMES)
+                    self.update_terminal_title()
                     self.render_all()
             except asyncio.CancelledError:
                 raise
@@ -1457,6 +1463,7 @@ class ComfyHelperApp(App[None]):
         self.sync_queue_totals(self.runtime.running + self.runtime.pending)
         active_prompt_ids = {item.prompt_id for item in self.runtime.running + self.runtime.pending}
         self.cleanup_finished_prompts(active_prompt_ids)
+        self.update_terminal_title()
         if self.pending_index >= len(self.runtime.pending):
             self.pending_index = max(0, len(self.runtime.pending) - 1)
 
@@ -1630,6 +1637,26 @@ class ComfyHelperApp(App[None]):
 
     def add_message(self, message: str) -> None:
         self.runtime.messages.appendleft(message)
+
+    def terminal_title(self) -> str:
+        if self.runtime.running:
+            return f"{SPINNER_FRAMES[self.spinner_index]} {TERMINAL_TITLE}"
+        return TERMINAL_TITLE
+
+    def update_terminal_title(self) -> None:
+        self.set_terminal_title(self.terminal_title())
+
+    def set_terminal_title(self, title: str) -> None:
+        if not sys.stdout.isatty():
+            return
+        if title == self.current_terminal_title:
+            return
+        self.current_terminal_title = title
+        try:
+            sys.stdout.write(f"\033]0;{title}\007")
+            sys.stdout.flush()
+        except Exception:
+            logging.debug("Failed to update terminal title", exc_info=True)
 
     def render_all(self) -> None:
         if not self.is_mounted:

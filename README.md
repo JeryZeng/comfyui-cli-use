@@ -57,6 +57,7 @@ http://127.0.0.1:8188
 ## Configurable Fields
 
 The app only exposes fields that are listed in each node's `_meta.configurable` array.
+Each entry is a full field path starting from the node's `inputs` object.
 
 Example:
 
@@ -77,13 +78,16 @@ Example:
 
 Rules:
 
-- Each item in `_meta.configurable` must match a key in that node's `inputs` object exactly.
+- Each item in `_meta.configurable` must match a field path under that node's `inputs` object exactly.
+- Nested object fields use dot paths. For example, `lora_2.strength` maps to `inputs.lora_2.strength`.
+- Only object paths are supported. Array indexes such as `items.0.name` are not supported.
 - Supported editable field types are strings, integers, floats, and booleans. Unsupported configured fields are counted and skipped during guided input.
 - `LoadImage.image` is a special case. It accepts a local file path or a directory path, and the CLI treats it as a path-based input instead of a plain string.
 - If a configured field name contains `path`, the CLI also enables path completion for it.
 - Fields not listed in `_meta.configurable` are ignored by guided input, even if they exist in the workflow JSON.
 - The app resolves fields in workflow dependency order before submission, so a field can reference another field even if that other field appears later in the guided input flow.
 - Template references use `${node_id.field_name}` syntax. A value can be a plain reference like `${117.value}` or a string with embedded references like `prefix_${117.value}_suffix`.
+- Nested configurable paths are referenced with the same full path, for example `${123.lora_2.strength}`.
 - Prefix a reference with a backslash to keep it as literal text. For example, `\${117.value}` submits `${117.value}`. Use `\\${117.value}` when you need one literal backslash followed by the resolved reference value.
 - Integer, float, and boolean fields allow whole-field references and keep the referenced type.
 - String fields allow interpolation and coerce referenced values to text during substitution.
@@ -93,6 +97,7 @@ Effects in the TUI:
 
 - The guided input flow walks through configurable fields in workflow graph order.
 - Each configurable field can be edited individually from the keyboard.
+- Nested fields are written back to only that path, so sibling values in the same object are preserved.
 - The right-side history panel shows the last recorded submission value for each configurable field.
 - Saved workflow history tracks only configurable fields, and it preserves the original template text for template-based values.
 
